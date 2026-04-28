@@ -1,6 +1,6 @@
 [Unit]
 Description=cc-bridge AI gateway
-Documentation=https://github.com/YOUR_GH_USER/cc-bridge
+Documentation=https://github.com/hxg5008/cc-bridge
 After=network-online.target
 Wants=network-online.target
 

@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-REPO="${CC_BRIDGE_REPO:-YOUR_GH_USER/cc-bridge}"
+REPO="${CC_BRIDGE_REPO:-hxg5008/cc-bridge}"
 INSTALL_DIR="${CC_BRIDGE_DIR:-/opt/cc-bridge}"
 SERVICE_USER="${CC_BRIDGE_USER:-ccbridge}"
 SERVICE_NAME="cc-bridge"

@@ -23,10 +23,10 @@
 
 ```bash
 # 公开仓库:
-curl -fsSL https://raw.githubusercontent.com/YOUR_GH_USER/cc-bridge/ccb/scripts/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/hxg5008/cc-bridge/ccb/scripts/bootstrap.sh | sudo bash
 
 # 私有仓库:
-curl -fsSL https://raw.githubusercontent.com/YOUR_GH_USER/cc-bridge/ccb/scripts/bootstrap.sh \
+curl -fsSL https://raw.githubusercontent.com/hxg5008/cc-bridge/ccb/scripts/bootstrap.sh \
     | sudo GH_TOKEN=ghp_xxxxxxxxxx bash
 ```
 
@@ -36,7 +36,7 @@ bootstrap.sh 会自动:装依赖 → 拉 deploy 包 → 跑 install.sh → 验�
 
 ```bash
 # 1. 拉部署包
-curl -fL https://github.com/YOUR_GH_USER/cc-bridge/releases/latest/download/cc-bridge-deploy.tar.gz \
+curl -fL https://github.com/hxg5008/cc-bridge/releases/latest/download/cc-bridge-deploy.tar.gz \
     | tar xz
 cd cc-bridge-deploy
 
@@ -142,8 +142,8 @@ certbot --nginx -d api.example.com
 |---|---|---|
 | `SERVER_HOST` | 127.0.0.1 | 监听地址 (公网部署务必只听本地, 反代转发) |
 | `SERVER_PORT` | 5674 | 监听端口 |
-| `DATABASE_DRIVER` | sqlite | sqlite \| postgres |
-| `DATABASE_DSN` | 自动 | postgres 时填完整 DSN |
+| `DATABASE_DRIVER` | postgres | 仅支持 postgres (SQLite 已下线) |
+| `DATABASE_DSN` | - | 必填: 完整 PostgreSQL DSN |
 | `REDIS_HOST` | 留空 | 留空走 in-memory cache;多机部署填 redis 地址 |
 | `ADMIN_PASSWORD` | 随机 | 管理后台密码 |
 | `LOG_LEVEL` | info | debug / info / warn / error |
@@ -180,17 +180,13 @@ certbot --nginx -d api.example.com
 
 ## 备份
 
-SQLite 文件 `/opt/cc-bridge/data/claude-code-gateway.db`,加 cron:
+PostgreSQL 标准备份: `pg_dump | gzip > backup.sql.gz`，例:
 
 ```bash
 # /etc/cron.d/cc-bridge-backup
-0 * * * * ccbridge cp /opt/cc-bridge/data/claude-code-gateway.db \
-    /opt/cc-bridge/backups/db-hourly-$(date +\%H).db 2>/dev/null
-0 3 * * * ccbridge cp /opt/cc-bridge/data/claude-code-gateway.db \
-    /opt/cc-bridge/backups/db-daily-$(date +\%a).db 2>/dev/null
+0 * * * * ccbridge pg_dump "$DATABASE_DSN" | gzip > /opt/cc-bridge/backups/db-hourly-$(date +\%H).sql.gz 2>/dev/null
+0 3 * * * ccbridge pg_dump "$DATABASE_DSN" | gzip > /opt/cc-bridge/backups/db-daily-$(date +\%a).sql.gz 2>/dev/null
 ```
-
-或 Postgres → 标准 `pg_dump | gzip > backup.sql.gz`。
 
 ---
 
@@ -199,8 +195,8 @@ SQLite 文件 `/opt/cc-bridge/data/claude-code-gateway.db`,加 cron:
 **Q: 升级失败回滚后要怎么排查?**
 A: `journalctl -u cc-bridge --since "5 min ago"`,常见原因:DB schema 不兼容(迁移失败) / 端口被占 / .env 配置错。修复后 `sudo ./scripts/upgrade.sh --force` 重试。
 
-**Q: 怎么切到 Postgres?**
-A: 先在 .env 改 `DATABASE_DRIVER=postgres` 和 `DATABASE_DSN=postgres://...`,然后**先用 `pg_dump` 把 SQLite 数据导过去** (网关本身不带数据迁移工具),最后 restart。
+**Q: 我以前用的 SQLite 怎么迁?**
+A: SQLite 在 v1.8.x 已移除。一次性迁移用 `pgloader sqlite:///path/to/old.db postgresql:///cc-bridge` 即可（pgloader 自动建表 + 转 schema）。迁移完成后 .env 改成 `DATABASE_DRIVER=postgres` + 填 DSN，重启服务。
 
 **Q: 多台机器分担流量怎么办?**
 A: 走 Postgres + Redis (sticky session 跨机器需要 Redis),Caddy/Nginx 前置做 round-robin。每台机器各自跑 install.sh,共用同一个 DATABASE_DSN 和 REDIS_HOST。

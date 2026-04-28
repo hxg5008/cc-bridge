@@ -20,48 +20,33 @@
 
 ---
 
-> ## 📦 SQLite 数据迁移指南(从 `claude-code-gateway` 升级)
+> ## 📦 数据库迁移指南
 >
-> 本项目在 v1.7.6 由 `claude-code-gateway` 更名为 `cc-bridge`,用户可见的镜像名、Compose 卷名、前端标题均已同步。**Cargo crate 名、SQLite 默认文件名、localStorage 登录态 key 保持不变**,因此非 Docker 用户升级**无需任何额外操作**,老的 `data/claude-code-gateway.db` 直接继续使用。
+> v1.8.x 起仅支持 PostgreSQL，老 SQLite 路径已下线（多并发写锁问题）。
 >
-> ### Docker Compose 用户必读
->
-> Compose 持久卷由 `claude-code-gateway-data` 改为 `cc-bridge-data`,**直接 `docker compose up` 会挂到空卷,等于丢数据**。升级步骤:
+> ### 从 SQLite 一次性迁过来
 >
 > ```bash
-> # 1. 停容器(不要加 -v,那样会删老卷)
-> docker compose down
+> # 1. 起 PostgreSQL（compose 部署直接用本仓库的 docker-compose.yml）
+> docker compose up -d postgres
 >
-> # 2. 确认老卷存在
-> docker volume ls | grep claude-code-gateway-data
->
-> # 3. 创建新卷并拷贝内容(含 SQLite 文件 data/claude-code-gateway.db)
-> docker volume create cc-bridge-data
+> # 2. 用 pgloader 把老 SQLite 迁到 PG（自动建表 + 转 schema + 拷数据）
 > docker run --rm \
->     -v claude-code-gateway-data:/from \
->     -v cc-bridge-data:/to \
->     alpine sh -c 'cp -a /from/. /to/'
+>     -v /path/to/old/data:/data \
+>     --network cc-bridge_default \
+>     dimitri/pgloader:latest \
+>     pgloader sqlite:///data/claude-code-gateway.db \
+>              postgresql://cc-bridge:cc-bridge@postgres:5432/cc-bridge
 >
-> # 4. 拉新镜像并启动(docker-compose.yml 已指向 ghcr.io/mamoworks/cc-bridge)
-> docker compose pull
+> # 3. 启动新版本
 > docker compose up -d
->
-> # 5. 进容器确认数据库正常
-> docker compose exec cc-bridge ls -lh data/
-> # 应看到 data/claude-code-gateway.db 和同路径的 -wal/-shm
->
-> # 6. 确认服务稳定后,删除老卷释放空间
-> docker volume rm claude-code-gateway-data
 > ```
 >
-> ### `docker run` / 裸机部署用户
->
-> - **裸机(直接跑二进制)**:DB 文件默认路径 `./data/claude-code-gateway.db` 未改动,升级新版本后继续读写同一个文件,零迁移。
-> - **`docker run -v /host/path:/app/data`**:宿主机目录不变,换镜像地址即可。
+> 迁完后老 `data/` 目录可以删了。Compose 卷也只剩 `postgres-data`。
 >
 > ### 回滚
 >
-> 如果升级后异常需要回到旧版,老卷 `claude-code-gateway-data` 在步骤 6 之前都还在,`git checkout` 到旧 compose 文件 + `docker compose up -d` 即可回滚。
+> 实在要回到 SQLite 版本：`git checkout v1.8.0~1` 拉上一版二进制 + 老 `.env`，老 `data/claude-code-gateway.db` 仍能读。但**不建议长期回退**——SQLite 在并发场景下的锁问题就是这次砍掉它的原因。
 
 ---
 
@@ -124,7 +109,7 @@
 
 **平台支持**
 - Vue 3 Web 管理后台
-- SQLite / PostgreSQL 双数据库
+- PostgreSQL
 - Redis / 内存缓存
 - Docker 多架构镜像
 - Linux / Windows 单二进制分发
@@ -145,7 +130,7 @@
 | Node.js | 22 | 前端构建 |
 | npm | - | 随 Node.js 安装 |
 | Redis | 可选 | 多实例部署需要 |
-| PostgreSQL | 可选 | 默认使用 SQLite |
+| PostgreSQL | 必需 | 持久化存储 (Compose 自带) |
 | Docker | 可选 | 容器化部署 |
 
 ### 三步启动
@@ -213,15 +198,15 @@ curl http://127.0.0.1:5674/v1/messages \
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `DATABASE_DRIVER` | `sqlite` | `sqlite` 或 `postgres` |
-| `DATABASE_DSN` | - | 完整 DSN，设置后优先使用；`DATABASE_DRIVER=postgres` 且留空时，程序会自动使用 `docker compose` 里的 `postgres` 容器 |
+| `DATABASE_DRIVER` | `postgres` | 仅支持 `postgres`（v1.8.x 起 SQLite 已下线） |
+| `DATABASE_DSN` | compose 内默认 `postgres://cc-bridge:cc-bridge@postgres:5432/cc-bridge?sslmode=disable` | 完整 DSN，设置后优先使用；留空时程序会自动拉起 `docker compose` 里的 `postgres` 容器 |
 | `DATABASE_HOST` | 自动：宿主机 `127.0.0.1` / 容器内 `postgres` | PostgreSQL 主机 |
 | `DATABASE_PORT` | `5432` | PostgreSQL 端口 |
 | `DATABASE_USER` | `POSTGRES_USER` 或 `postgres` | PostgreSQL 用户名 |
 | `DATABASE_PASSWORD` | `POSTGRES_PASSWORD` 或空 | PostgreSQL 密码 |
 | `DATABASE_DBNAME` | `POSTGRES_DB` 或 `claude_code_gateway` | PostgreSQL 数据库名 |
 
-> SQLite 自动创建目录并启用 WAL 模式。PostgreSQL 在未提供 `DATABASE_DSN` 时，会先拉起根目录 `docker-compose.yml` 里的 `postgres` 服务，然后自动创建 `DATABASE_DBNAME` 指定的数据库。
+> PostgreSQL 在未提供 `DATABASE_DSN` 时，会先拉起根目录 `docker-compose.yml` 里的 `postgres` 服务，然后自动创建 `DATABASE_DBNAME` 指定的数据库。SQLite 在 v1.8.x 已彻底移除——多并发下异步写（用量、OAuth 刷新、telemetry）会触发 `database is locked`，是这次砍掉的原因。
 
 ### Redis（可选）
 
@@ -239,8 +224,8 @@ curl http://127.0.0.1:5674/v1/messages \
 ```env
 SERVER_HOST=0.0.0.0
 SERVER_PORT=5674
-DATABASE_DRIVER=sqlite
-DATABASE_DSN=data/claude-code-gateway.db
+DATABASE_DRIVER=postgres
+DATABASE_DSN=postgres://cc-bridge:cc-bridge@postgres:5432/cc-bridge?sslmode=disable
 ADMIN_PASSWORD=change-me
 LOG_LEVEL=info
 ```
@@ -311,12 +296,13 @@ cargo build --release
 
 ```bash
 cp .env.example .env
-cd docker && docker compose up -d
+docker compose up -d                     # 启动 cc-bridge + postgres
+docker compose --profile redis up -d     # 多副本时同时启用 redis
 ```
 
 
 
-> SQLite 数据持久化到命名卷 `cc-bridge-data`。从老版本升级请参考文档顶部的 [SQLite 数据迁移指南](#-sqlite-数据迁移指南从-claude-code-gateway-升级)。
+> 数据持久化到命名卷 `postgres-data`。从老版本（SQLite）升级请参考文档顶部的[数据库迁移指南](#-数据库迁移指南)。
 
 ### 生产建议
 
@@ -502,7 +488,7 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 │        │              │                                             │
 │        v              v                                             │
 │   ┌──────────────────────────────┐                                  │
-│   │   SQLite / PostgreSQL        │                                  │
+│   │   PostgreSQL                  │                                  │
 │   │   Redis / Memory Cache       │                                  │
 │   └──────────────────────────────┘                                  │
 │                                                                     │

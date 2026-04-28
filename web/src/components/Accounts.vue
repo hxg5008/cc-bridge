@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue';
-import { api, type Account, type OAuthExchangeResult, type OpenAITokenInfo, type UsageData } from '../api';
+import { useRoute } from 'vue-router';
+import { api, type Account, type AccountCategory, type OAuthExchangeResult, type OpenAITokenInfo, type UsageData } from '../api';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -21,17 +22,90 @@ const accounts = ref<Account[]>([]);
 const currentPage = ref(1);
 const totalPages = ref(1);
 const totalCount = ref(0);
-const pageSize = 12;
+/** 视图模式: 'detail' = 现有卡片详情视图, 'compact' = 表格紧凑视图 (大量账号场景) */
+const viewMode = ref<'detail' | 'compact'>(
+  (localStorage.getItem('cc-bridge.view_mode') as 'detail' | 'compact') || 'detail',
+);
+/** pageSize 自适应: detail 12 / compact 50 */
+const pageSize = computed(() => (viewMode.value === 'compact' ? 50 : 12));
+function onViewModeChange(mode: 'detail' | 'compact') {
+  if (viewMode.value === mode) return;
+  viewMode.value = mode;
+  localStorage.setItem('cc-bridge.view_mode', mode);
+  currentPage.value = 1; // 切换视图重置到第 1 页, 因 pageSize 变了
+  load();
+}
+/** 关键字搜索 (前端 client-side, 按 email/name 过滤) */
+const searchQuery = ref<string>('');
 /** 平台过滤 (UI 端筛选; '' = 全部) */
 const platformFilter = ref<string>('');
-const filteredAccounts = computed(() => {
-  if (!platformFilter.value) return accounts.value;
-  return accounts.value.filter((a) =>
-    platformFilter.value === 'claude'
-      ? !a.platform || a.platform === 'claude'
-      : a.platform === platformFilter.value,
-  );
+/** 分类筛选 (来自 URL ?filter=, 跟 dashboard 顶部卡片联动) */
+const route = useRoute();
+const categoryFilter = computed<AccountCategory | 'all'>(() => {
+  const f = route.query.filter as string | undefined;
+  if (!f) return 'all';
+  if (['available', 'rate_limited', 'invalid', 'banned', 'stopped'].includes(f)) {
+    return f as AccountCategory;
+  }
+  return 'all';
 });
+const filteredAccounts = computed(() => {
+  let list = accounts.value;
+  if (platformFilter.value) {
+    list = list.filter((a) =>
+      platformFilter.value === 'claude'
+        ? !a.platform || a.platform === 'claude'
+        : a.platform === platformFilter.value,
+    );
+  }
+  if (categoryFilter.value !== 'all') {
+    list = list.filter((a) => a.category === categoryFilter.value);
+  }
+  if (searchQuery.value.trim()) {
+    const q = searchQuery.value.trim().toLowerCase();
+    list = list.filter((a) =>
+      (a.email || '').toLowerCase().includes(q) ||
+      (a.name || '').toLowerCase().includes(q),
+    );
+  }
+  return list;
+});
+
+/** 5 类徽章中文文字 */
+function categoryLabel(c?: AccountCategory): string {
+  switch (c) {
+    case 'available': return '可用';
+    case 'rate_limited': return '限流中';
+    case 'invalid': return '失效';
+    case 'banned': return '封禁';
+    case 'stopped': return '停用';
+    default: return '未知';
+  }
+}
+
+/** 5 类徽章颜色 */
+function categoryBadgeClass(c?: AccountCategory): string {
+  switch (c) {
+    case 'available': return 'bg-emerald-100 text-emerald-700';
+    case 'rate_limited': return 'bg-orange-100 text-orange-700';
+    case 'invalid': return 'bg-red-100 text-red-700';
+    case 'banned': return 'bg-gray-700 text-white';
+    case 'stopped': return 'bg-gray-200 text-gray-600';
+    default: return 'bg-gray-100 text-gray-500';
+  }
+}
+
+/** 限流恢复倒计时（人类可读） */
+function recoversInText(iso?: string): string {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (isNaN(t)) return '';
+  const sec = Math.max(0, Math.ceil((t - Date.now()) / 1000));
+  if (sec === 0) return '即将恢复';
+  if (sec < 60) return `${sec}s 后恢复`;
+  if (sec < 3600) return `${Math.ceil(sec / 60)}m 后恢复`;
+  return `${Math.floor(sec / 3600)}h${Math.ceil((sec % 3600) / 60)}m 后恢复`;
+}
 /** 表单弹窗是否可见 */
 const showForm = ref(false);
 /** 删除确认弹窗是否可见 */
@@ -75,7 +149,7 @@ const refreshingUsage = ref<number | null>(null);
 /** 加载账号列表 */
 async function load() {
   try {
-    const res = await api.listAccounts(currentPage.value, pageSize);
+    const res = await api.listAccounts(currentPage.value, pageSize.value);
     accounts.value = res.data ?? [];
     totalPages.value = res.total_pages;
     totalCount.value = res.total;
@@ -103,21 +177,61 @@ const visiblePages = computed(() => {
   return pages;
 });
 
-/** 自动重载定时器 */
+/** 自动重载定时器 + 间隔（秒,0=关闭） */
 let autoReloadTimer: ReturnType<typeof setInterval> | null = null;
+const AUTO_REFRESH_OPTIONS = [
+  { value: 0, label: '不自动' },
+  { value: 5, label: '5 秒' },
+  { value: 10, label: '10 秒' },
+  { value: 30, label: '30 秒' },
+  { value: 60, label: '60 秒' },
+];
+const autoRefreshSec = ref<number>(
+  Number(localStorage.getItem('cc-bridge.auto_refresh_sec') ?? 60),
+);
+
+function applyAutoRefreshTimer() {
+  if (autoReloadTimer) {
+    clearInterval(autoReloadTimer);
+    autoReloadTimer = null;
+  }
+  if (autoRefreshSec.value > 0) {
+    autoReloadTimer = setInterval(async () => {
+      // 1. 触发后端批量刷新所有 OAuth 账号用量 (走 60s 服务端缓存,不会真频繁打上游)
+      try {
+        await api.refreshAllUsage();
+      } catch {
+        // 失败不阻断本地 reload
+      }
+      // 2. 重拉账号列表 + dashboard 计数
+      await load();
+      emit('refresh');
+    }, autoRefreshSec.value * 1000);
+  }
+}
+
+function onAutoRefreshChange() {
+  localStorage.setItem('cc-bridge.auto_refresh_sec', String(autoRefreshSec.value));
+  applyAutoRefreshTimer();
+}
 
 onMounted(() => {
   load();
-  // 每 60 秒静默重拉账户列表（usage_data 会带新值过来）
-  autoReloadTimer = setInterval(() => {
-    load();
-  }, 60 * 1000);
+  applyAutoRefreshTimer();
+  // 每秒推进一次 tick，让 rate_limited_until 倒计时活起来
+  tickTimer = setInterval(() => {
+    tick.value = (tick.value + 1) % 1_000_000;
+  }, 1000);
 });
 
 onUnmounted(() => {
   if (autoReloadTimer) {
     clearInterval(autoReloadTimer);
     autoReloadTimer = null;
+  }
+  if (tickTimer) {
+    clearInterval(tickTimer);
+    tickTimer = null;
   }
 });
 
@@ -341,6 +455,40 @@ async function refreshUsage(id: number) {
   refreshingUsage.value = null;
 }
 
+/** 清除内存中残留的短期限流标记（死锁逃生口） */
+const clearingLimit = ref<number | null>(null);
+async function clearLimit(id: number) {
+  clearingLimit.value = id;
+  try {
+    const res = await api.clearLimit(id);
+    if (res.cleared) {
+      toast('已清除限流标记，账号已恢复调度');
+      // 立即从前端模型里去掉倒计时,不等下次刷新
+      const acc = accounts.value.find(a => a.id === id);
+      if (acc) acc.rate_limited_until_runtime = undefined;
+    } else {
+      toast('当前没有可清除的限流标记');
+    }
+    await load();
+  } catch (e: unknown) {
+    toast((e as Error).message || '清除失败');
+  }
+  clearingLimit.value = null;
+}
+
+/** 倒计时计算: rate_limited_until_runtime - now，单位秒 */
+function rateLimitRemainingSec(iso?: string): number {
+  if (!iso) return 0;
+  const t = Date.parse(iso);
+  if (isNaN(t)) return 0;
+  const sec = Math.ceil((t - Date.now()) / 1000);
+  return sec > 0 ? sec : 0;
+}
+
+/** UI 触发的"现在"，每秒滴答一次让倒计时刷新（不刷数据） */
+const tick = ref(0);
+let tickTimer: ReturnType<typeof setInterval> | null = null;
+
 /**
  * 切换账号调度状态（启用/停用）
  * @param a 账号对象
@@ -418,9 +566,16 @@ function isRateLimited(a: Account): boolean {
 }
 
 /**
- * 获取状态徽章样式
+ * 获取状态徽章样式 (优先用后端返回的 category, 兜底回退到旧 status 判断)
  */
 function statusStyle(a: Account): { class: string; label: string } {
+  if (a.category) {
+    return {
+      class: `${categoryBadgeClass(a.category)} border border-transparent`,
+      label: categoryLabel(a.category),
+    };
+  }
+  // 老服务端兼容
   if (a.status === 'active' && isRateLimited(a)) {
     return { class: 'bg-amber-50 text-amber-700 border-amber-200', label: '限流中' };
   }
@@ -908,9 +1063,32 @@ async function copyText(text: string) {
 <template>
   <div class="space-y-4">
     <!-- 标题栏 -->
-    <div class="flex justify-between items-center">
-      <div class="flex items-center gap-3">
+    <div class="flex flex-wrap justify-between items-center gap-y-2">
+      <div class="flex items-center gap-3 flex-wrap">
         <h2 class="text-lg font-semibold text-[#29261e]">账号管理</h2>
+        <!-- 视图切换 -->
+        <div class="flex items-center bg-[#f9f6f1] border border-[#e8e2d9] rounded-lg overflow-hidden">
+          <button
+            type="button"
+            @click="onViewModeChange('detail')"
+            class="px-3 py-1.5 text-sm transition-colors"
+            :class="viewMode === 'detail'
+              ? 'bg-[#c4704f] text-white font-medium'
+              : 'text-[#5c5647] hover:bg-[#e8e2d9]/40'"
+          >
+            详情
+          </button>
+          <button
+            type="button"
+            @click="onViewModeChange('compact')"
+            class="px-3 py-1.5 text-sm transition-colors"
+            :class="viewMode === 'compact'
+              ? 'bg-[#c4704f] text-white font-medium'
+              : 'text-[#5c5647] hover:bg-[#e8e2d9]/40'"
+          >
+            紧凑
+          </button>
+        </div>
         <select
           v-model="platformFilter"
           class="text-sm bg-white border border-[#e8e2d9] rounded-lg px-3 py-1.5 text-[#5c5647] hover:border-[#c4704f]/50 focus:outline-none focus:border-[#c4704f]"
@@ -921,6 +1099,22 @@ async function copyText(text: string) {
           <option value="gemini">Gemini</option>
           <option value="antigravity">Antigravity</option>
         </select>
+        <select
+          v-model.number="autoRefreshSec"
+          @change="onAutoRefreshChange"
+          class="text-sm bg-white border border-[#e8e2d9] rounded-lg px-3 py-1.5 text-[#5c5647] hover:border-[#c4704f]/50 focus:outline-none focus:border-[#c4704f]"
+          title="自动刷新: 拉用量 + 重渲账号列表 + dashboard 计数。后端走 60s 缓存,不会真高频打上游 API"
+        >
+          <option v-for="opt in AUTO_REFRESH_OPTIONS" :key="opt.value" :value="opt.value">
+            自动刷新: {{ opt.label }}
+          </option>
+        </select>
+        <input
+          v-model="searchQuery"
+          type="search"
+          placeholder="搜索 email / name..."
+          class="text-sm bg-white border border-[#e8e2d9] rounded-lg px-3 py-1.5 text-[#5c5647] hover:border-[#c4704f]/50 focus:outline-none focus:border-[#c4704f] w-48"
+        />
         <span class="text-xs text-[#8c8475]">{{ filteredAccounts.length }} / {{ accounts.length }}</span>
       </div>
       <div class="flex gap-2">
@@ -951,8 +1145,108 @@ async function copyText(text: string) {
       </div>
     </div>
 
-    <!-- 账号卡片列表 -->
-    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+    <!-- 紧凑视图: 表格 -->
+    <div v-if="viewMode === 'compact'" class="bg-white border border-[#e8e2d9] rounded-xl overflow-hidden">
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead class="bg-[#f9f6f1] border-b border-[#e8e2d9]">
+            <tr class="text-left text-xs font-medium text-[#8c8475]">
+              <th class="px-3 py-2.5 whitespace-nowrap">Email / Name</th>
+              <th class="px-2 py-2.5 whitespace-nowrap">平台</th>
+              <th class="px-2 py-2.5 whitespace-nowrap">鉴权</th>
+              <th class="px-2 py-2.5 whitespace-nowrap">状态</th>
+              <th class="px-2 py-2.5 whitespace-nowrap text-right">5h</th>
+              <th class="px-2 py-2.5 whitespace-nowrap text-right">7d</th>
+              <th class="px-2 py-2.5 whitespace-nowrap">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="a in filteredAccounts"
+              :key="a.id"
+              class="border-b border-[#f0ebe4] hover:bg-[#f9f6f1]/50 cursor-pointer transition-colors"
+              @click="openEdit(a)"
+            >
+              <td class="px-3 py-2 align-middle">
+                <div class="font-medium text-[#29261e] truncate max-w-[260px]" :title="a.email">{{ a.email }}</div>
+                <div v-if="a.name && a.name !== a.email" class="text-xs text-[#8c8475] truncate max-w-[260px]">{{ a.name }}</div>
+              </td>
+              <td class="px-2 py-2 align-middle">
+                <span class="px-1.5 py-0.5 rounded text-[10px] font-medium"
+                      :class="a.platform === 'openai'
+                        ? 'bg-emerald-100 text-emerald-700'
+                        : 'bg-orange-100 text-orange-700'">
+                  {{ a.platform === 'openai' ? 'OpenAI' : 'Anth' }}
+                </span>
+              </td>
+              <td class="px-2 py-2 align-middle text-xs text-[#5c5647]">
+                {{ a.auth_type === 'oauth' ? 'OAuth' : 'Token' }}
+              </td>
+              <td class="px-2 py-2 align-middle">
+                <Badge :class="statusStyle(a).class" class="border text-xs font-medium">
+                  {{ statusStyle(a).label }}
+                </Badge>
+                <div v-if="a.category === 'rate_limited' && a.category_recovers_at"
+                     class="text-[10px] text-orange-700 mt-0.5">
+                  {{ tick, recoversInText(a.category_recovers_at) }}
+                </div>
+              </td>
+              <td class="px-2 py-2 align-middle text-right tabular-nums text-xs"
+                  :class="((a.usage_data?.five_hour?.utilization ?? 0) >= 100) ? 'text-orange-600 font-semibold' : 'text-[#5c5647]'">
+                {{ a.usage_data?.five_hour?.utilization != null
+                    ? (a.usage_data.five_hour.utilization as number).toFixed(0) + '%'
+                    : '—' }}
+              </td>
+              <td class="px-2 py-2 align-middle text-right tabular-nums text-xs"
+                  :class="((a.usage_data?.seven_day?.utilization ?? 0) >= 100) ? 'text-orange-600 font-semibold' : 'text-[#5c5647]'">
+                {{ a.usage_data?.seven_day?.utilization != null
+                    ? (a.usage_data.seven_day.utilization as number).toFixed(0) + '%'
+                    : '—' }}
+              </td>
+              <td class="px-2 py-2 align-middle whitespace-nowrap" @click.stop>
+                <div class="flex gap-1">
+                  <button
+                    type="button"
+                    @click="test(a.id)"
+                    :disabled="testing === a.id"
+                    class="text-xs px-2 py-1 rounded text-[#c4704f] hover:bg-[#c4704f]/10 disabled:opacity-50"
+                    title="测试账号活性"
+                  >测试</button>
+                  <button
+                    v-if="(!a.platform || a.platform === 'claude')"
+                    type="button"
+                    @click="refreshUsage(a.id)"
+                    :disabled="refreshingUsage === a.id"
+                    class="text-xs px-2 py-1 rounded text-[#c4704f] hover:bg-[#c4704f]/10 disabled:opacity-50"
+                    title="刷新用量"
+                  >用量</button>
+                  <button
+                    v-if="rateLimitRemainingSec(a.rate_limited_until_runtime) > 0 || tick === -1"
+                    type="button"
+                    @click="clearLimit(a.id)"
+                    :disabled="clearingLimit === a.id"
+                    class="text-xs px-2 py-1 rounded text-amber-600 hover:bg-amber-50 disabled:opacity-50"
+                    :title="`清除限流标记 (剩余 ${rateLimitRemainingSec(a.rate_limited_until_runtime)}s)`"
+                  >清限流</button>
+                  <button
+                    type="button"
+                    @click="confirmDelete(a.id)"
+                    class="text-xs px-2 py-1 rounded text-red-500 hover:bg-red-50"
+                    title="删除账号"
+                  >删除</button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div v-if="filteredAccounts.length === 0" class="text-center text-sm text-[#8c8475] py-8">
+        没有符合条件的账号
+      </div>
+    </div>
+
+    <!-- 详情视图: 卡片 (现有布局, 不动) -->
+    <div v-else class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
       <Card
         v-for="a in filteredAccounts"
         :key="a.id"
@@ -977,6 +1271,20 @@ async function copyText(text: string) {
               <Badge :class="statusStyle(a).class" class="border text-xs font-medium">
                 {{ statusStyle(a).label }}
               </Badge>
+              <!-- 限流中: 显示子原因 + 倒计时 (tick 是 hidden 依赖, 让倒计时每秒重渲染) -->
+              <span v-if="a.category === 'rate_limited' && a.category_reason"
+                    class="text-[10px] text-orange-700 max-w-[160px] text-right leading-tight"
+                    :title="`${a.category_reason}${a.category_recovers_at ? ' · ' + recoversInText(a.category_recovers_at) : ''}`">
+                {{ a.category_reason }}
+                <span v-if="a.category_recovers_at" class="opacity-70 block">{{ tick, recoversInText(a.category_recovers_at) }}</span>
+              </span>
+              <!-- 失效/封禁/停用: 显示原因 -->
+              <span v-else-if="(a.category === 'invalid' || a.category === 'banned' || a.category === 'stopped') && a.category_reason"
+                    class="text-[10px] max-w-[160px] text-right leading-tight"
+                    :class="a.category === 'invalid' ? 'text-red-600' : 'text-gray-500'"
+                    :title="a.category_reason">
+                {{ a.category_reason.length > 24 ? a.category_reason.slice(0, 24) + '…' : a.category_reason }}
+              </span>
               <span class="px-1.5 py-0.5 rounded text-[10px] font-medium"
                     :class="a.platform === 'openai'
                       ? 'bg-emerald-100 text-emerald-700'
@@ -1224,6 +1532,19 @@ async function copyText(text: string) {
               class="text-[#c4704f] hover:text-[#b5623f] hover:bg-[#c4704f]/5 h-8 px-3 text-xs flex-1"
             >
               {{ testing === a.id ? '测试中...' : '测试' }}
+            </Button>
+            <Button
+              v-if="rateLimitRemainingSec(a.rate_limited_until_runtime) > 0 || tick === -1"
+              variant="ghost"
+              size="sm"
+              @click="clearLimit(a.id)"
+              :disabled="clearingLimit === a.id"
+              :title="`内存软限流剩余 ${rateLimitRemainingSec(a.rate_limited_until_runtime)}s, 点击清除`"
+              class="text-amber-600 hover:text-amber-700 hover:bg-amber-50 h-8 px-3 text-xs flex-1"
+            >
+              {{ clearingLimit === a.id
+                ? '清除中...'
+                : `清限流 ${rateLimitRemainingSec(a.rate_limited_until_runtime)}s` }}
             </Button>
             <Button
               variant="ghost"

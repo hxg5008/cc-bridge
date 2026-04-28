@@ -38,20 +38,16 @@ async fn main() {
     // 注册 sqlx Any 驱动
     sqlx::any::install_default_drivers();
 
-    // 初始化数据库
-    let driver = cfg.database.driver();
+    // 初始化数据库（PostgreSQL only）
+    cfg.database.driver(); // 早期校验：拒绝 sqlite 等不再支持的 driver
     store::db::ensure_postgres_database(&cfg.database)
         .await
         .expect("prepare postgres failed");
     let dsn = cfg.database.dsn();
-    info!("database: {} ({})", driver, dsn);
+    info!("database: postgres ({})", dsn);
 
-    let pool = store::db::init_db(&driver, &dsn)
-        .await
-        .expect("init db failed");
-    store::db::migrate(&pool, &driver)
-        .await
-        .expect("migrate failed");
+    let pool = store::db::init_db(&dsn).await.expect("init db failed");
+    store::db::migrate(&pool).await.expect("migrate failed");
 
     // 缓存：优先 Redis，回退内存
     let cache: Arc<dyn store::cache::CacheStore> = match &cfg.redis {
@@ -80,14 +76,8 @@ async fn main() {
         }
     };
 
-    let account_store = Arc::new(store::account_store::AccountStore::new(
-        pool.clone(),
-        driver.clone(),
-    ));
-    let token_store = Arc::new(store::token_store::TokenStore::new(
-        pool.clone(),
-        driver.clone(),
-    ));
+    let account_store = Arc::new(store::account_store::AccountStore::new(pool.clone()));
+    let token_store = Arc::new(store::token_store::TokenStore::new(pool.clone()));
 
     // 一次性清理：Phase 1 之前旧限流路径写入的残留字段（status='active' 账号上的
     // rate_limited_at / rate_limit_reset_at / disable_reason）。幂等，每次启动执行。
@@ -98,6 +88,20 @@ async fn main() {
     }
 
     let limit_store = Arc::new(service::limit::LimitStore::new(account_store.clone()));
+
+    // 启动时从 DB 把 usage_data hydrate 进 LimitStore 内存,
+    // 否则重启后内存空, dashboard 会把全部 100% 的限流号显示为"可用"。
+    if let Ok(accs) = account_store.list().await {
+        let mut hydrated = 0u32;
+        for a in &accs {
+            if a.usage_data.is_object() && !a.usage_data.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                limit_store.ingest_usage_json(a.id, &a.usage_data);
+                hydrated += 1;
+            }
+        }
+        info!("hydrated LimitStore from DB: {} accounts", hydrated);
+    }
+
     let account_svc = Arc::new(service::account::AccountService::new(
         account_store.clone(),
         cache.clone(),

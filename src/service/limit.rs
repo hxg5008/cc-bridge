@@ -19,8 +19,9 @@ use crate::store::account_store::AccountStore;
 
 /// 内存 → DB 常规刷新 TTL。
 const DB_FLUSH_TTL: Duration = Duration::from_secs(5 * 60);
-/// 超过此 utilization（0.0-1.0 刻度）视为该窗口撞墙，立即紧急 flush 且 selector 判不可用。
-const HIT_THRESHOLD: f64 = 0.97;
+/// 当 utilization 达到此值（0.0-1.0 刻度）即认定该窗口撞上限,立即紧急 flush 且 selector 判不可用。
+/// 取 1.0 = 真正撞墙才挡（避免 97-99% 误挡）;依赖上游 absorb_headers 在 100% 时持续更新避免漏判。
+const HIT_THRESHOLD: f64 = 1.0;
 /// CF-layer 429（或 Anthropic 429 但无 retry-after）的默认短期隔离时长。
 const DEFAULT_429_BAN: Duration = Duration::from_secs(60);
 /// SetupToken RPM/TPM 预抢阈值：任一 counter 的 remaining/limit 低于该值即视为预抢。
@@ -399,6 +400,19 @@ impl LimitStore {
         }
         cleared
     }
+
+    /// 暴露给 UI: 当前内存里仍有效的 `rate_limited_until`。
+    /// 返回 `None` 表示该账号没有任何短期 ban，或已过期（UI 不应显示倒计时）。
+    pub fn peek_rate_limited_until(&self, account_id: i64) -> Option<DateTime<Utc>> {
+        let map = self.states.lock().unwrap();
+        let state = map.get(&account_id)?;
+        let until = state.rate_limited_until?;
+        if until > Utc::now() {
+            Some(until)
+        } else {
+            None
+        }
+    }
 }
 
 // ---- 解析辅助 ----
@@ -421,13 +435,13 @@ fn auto_clear_stale_runtime_flags(
     observed_five_hour: Option<&WindowSnapshot>,
     observed_seven_day: Option<&WindowSnapshot>,
 ) -> bool {
-    // 只信本次观测,不信内存里的陈旧窗口数据 —— 否则旧 state 双窗口都有但本次只
-    // 更新 five_hour 时,会拿旧 seven_day 当"健康证据"误清陈旧 status/until。
-    let (five, seven) = match (observed_five_hour, observed_seven_day) {
+    // 至少要观测到一个窗口才能判定健康。两个都缺 → 没证据，不清。
+    let observed = match (observed_five_hour, observed_seven_day) {
+        (None, None) => return false,
+        (Some(w), None) | (None, Some(w)) => (w.utilization, w.utilization),
         (Some(f), Some(s)) => (f.utilization, s.utilization),
-        _ => return false,
     };
-    if five >= HIT_THRESHOLD || seven >= HIT_THRESHOLD {
+    if observed.0 >= HIT_THRESHOLD || observed.1 >= HIT_THRESHOLD {
         return false;
     }
 
@@ -1079,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn decide_flush_crossing_97_triggers() {
+    fn decide_flush_crossing_full_triggers() {
         let recent = Instant::now();
         let prev = LimitState {
             last_db_flush_at: Some(recent),
@@ -1094,7 +1108,7 @@ mod tests {
         let new = LimitState {
             last_db_flush_at: Some(recent),
             five_hour: Some(WindowSnapshot {
-                utilization: 0.97,
+                utilization: 1.0,
                 resets_at: Utc::now() + chrono::Duration::hours(2),
                 status: UnifiedStatus::Allowed,
                 surpassed_threshold: None,
@@ -1142,12 +1156,12 @@ mod tests {
     }
 
     #[test]
-    fn availability_97pct_5h_is_unavailable() {
+    fn availability_full_5h_is_unavailable() {
         let state = LimitState {
             five_hour: Some(WindowSnapshot {
-                utilization: 0.97,
+                utilization: 1.0,
                 resets_at: Utc::now() + chrono::Duration::hours(1),
-                status: UnifiedStatus::AllowedWarning,
+                status: UnifiedStatus::Rejected,
                 surpassed_threshold: None,
             }),
             ..Default::default()
@@ -1203,9 +1217,9 @@ mod tests {
         let five_reset = Utc::now() + chrono::Duration::hours(2);
         let state = LimitState {
             five_hour: Some(WindowSnapshot {
-                utilization: 0.98,
+                utilization: 1.0,
                 resets_at: five_reset,
-                status: UnifiedStatus::AllowedWarning,
+                status: UnifiedStatus::Rejected,
                 surpassed_threshold: None,
             }),
             seven_day: Some(WindowSnapshot {
@@ -1226,13 +1240,13 @@ mod tests {
         let seven_reset = Utc::now() + chrono::Duration::days(5);
         let state = LimitState {
             five_hour: Some(WindowSnapshot {
-                utilization: 0.98,
+                utilization: 1.0,
                 resets_at: five_reset,
                 status: UnifiedStatus::Rejected,
                 surpassed_threshold: None,
             }),
             seven_day: Some(WindowSnapshot {
-                utilization: 0.99,
+                utilization: 1.0,
                 resets_at: seven_reset,
                 status: UnifiedStatus::Rejected,
                 surpassed_threshold: None,
@@ -1488,10 +1502,12 @@ mod tests {
     }
 
     /// P0 修复 #2：缺失任一窗口（5h 或 7d）时不能清——信息不全宁可保守。
-    /// 防止 API 返回 partial usage 时被误判为"全 0% 健康"。
+    /// auto_clear 行为：单窗口观测健康也允许清。
+    /// 设计选择：宁可对 partial usage 偶尔多发一次请求触发上游 429 重置 state,
+    /// 也不要让账号在死锁里永远被挡。详见 [`auto_clear_stale_runtime_flags`] 注释。
     #[test]
-    fn auto_clear_stale_does_nothing_when_a_window_is_missing() {
-        // 仅 five_hour, 没有 seven_day
+    fn auto_clear_stale_clears_when_single_window_healthy() {
+        // 仅 five_hour, 没有 seven_day, 5h 健康 → 应清
         let mut state = LimitState {
             rate_limited_until: Some(Utc::now() + chrono::Duration::hours(1)),
             status: Some(UnifiedStatus::Rejected),
@@ -1505,11 +1521,43 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !run_auto_clear_with_state_as_observed(&mut state),
-            "缺 seven_day 时不应触发清理"
+            run_auto_clear_with_state_as_observed(&mut state),
+            "单窗口健康应清"
         );
-        assert!(state.rate_limited_until.is_some(), "rate_limited_until 应保留");
-        assert_eq!(state.status, Some(UnifiedStatus::Rejected), "status 应保留");
+        assert!(state.rate_limited_until.is_none());
+        assert_eq!(state.status, Some(UnifiedStatus::Allowed));
+    }
+
+    /// 单窗口观测高时仍然不清——即使另一个窗口缺失,也不能拿这个高的当"健康证据"。
+    #[test]
+    fn auto_clear_stale_does_not_clear_when_single_window_high() {
+        let observed_high = WindowSnapshot {
+            utilization: HIT_THRESHOLD + 0.001,
+            resets_at: Utc::now() + chrono::Duration::hours(4),
+            status: UnifiedStatus::Rejected,
+            surpassed_threshold: Some(0.97),
+        };
+        let mut state = LimitState {
+            rate_limited_until: Some(Utc::now() + chrono::Duration::hours(1)),
+            status: Some(UnifiedStatus::Rejected),
+            ..Default::default()
+        };
+        let cleared = auto_clear_stale_runtime_flags(&mut state, Some(&observed_high), None);
+        assert!(!cleared, "单窗口高于阈值时不应清");
+        assert!(state.rate_limited_until.is_some());
+    }
+
+    /// 完全无观测（两窗口都 None）→ 没证据,绝对不清。
+    #[test]
+    fn auto_clear_stale_does_nothing_when_no_observation() {
+        let mut state = LimitState {
+            rate_limited_until: Some(Utc::now() + chrono::Duration::hours(1)),
+            status: Some(UnifiedStatus::Rejected),
+            ..Default::default()
+        };
+        let cleared = auto_clear_stale_runtime_flags(&mut state, None, None);
+        assert!(!cleared, "无观测时不应清");
+        assert!(state.rate_limited_until.is_some());
     }
 
     /// P0 修复 #3：当 overage_status=Rejected 或 overage_disabled_reason 存在时，
@@ -1551,6 +1599,7 @@ mod tests {
     /// 只解析出 five_hour 一个窗口。helper 必须只信本次观测,不信旧 state 字段,
     /// 否则会拿过期数据当"健康证据"误清陈旧 status/until。
     ///
+    /// auto_clear 在新版（放宽后）的行为: 单窗口观测时也用观测值判健康,不再拿 state 上的旧窗口数据当证据。
     /// 这是 codex 复审指出的真实漏点（见 round-2 review）。
     #[test]
     fn auto_clear_stale_does_not_use_stale_window_from_state() {
@@ -1573,20 +1622,29 @@ mod tests {
             ..Default::default()
         };
 
-        // 本次观测：只有 five_hour（API 返回 partial）, seven_day = None
-        let observed_five = WindowSnapshot {
-            utilization: 0.15,
+        // 本次观测：只有 five_hour（API 返回 partial）, seven_day = None,
+        // 但本次观测的 five_hour 自身高于阈值 → 不应清（即使 state 上的旧 seven_day 看着健康）
+        let observed_five_high = WindowSnapshot {
+            utilization: HIT_THRESHOLD + 0.001,
             resets_at: Utc::now() + chrono::Duration::hours(4),
-            status: UnifiedStatus::Allowed,
-            surpassed_threshold: None,
+            status: UnifiedStatus::Rejected,
+            surpassed_threshold: Some(0.97),
         };
-        let cleared = auto_clear_stale_runtime_flags(&mut state, Some(&observed_five), None);
+        let cleared =
+            auto_clear_stale_runtime_flags(&mut state, Some(&observed_five_high), None);
         assert!(
             !cleared,
-            "本次观测缺 seven_day 时不应清,即使 state 上有旧 seven_day"
+            "本次观测的窗口本身高于阈值时不应清,即使 state 上有旧窗口数据看着健康"
         );
-        assert!(state.rate_limited_until.is_some());
-        assert_eq!(state.status, Some(UnifiedStatus::Rejected));
+        assert!(
+            state.rate_limited_until.is_some(),
+            "rate_limited_until 必须保留"
+        );
+        assert_eq!(
+            state.status,
+            Some(UnifiedStatus::Rejected),
+            "status 必须保留"
+        );
     }
 
     /// seven_day 高 utilization 时也不清(覆盖原测试只测 five_hour)。
@@ -1812,7 +1870,7 @@ mod tests {
         let five_reset = Utc::now() + chrono::Duration::hours(2);
         let state = LimitState {
             five_hour: Some(WindowSnapshot {
-                utilization: 0.99,
+                utilization: 1.0,
                 resets_at: five_reset,
                 status: UnifiedStatus::Rejected,
                 surpassed_threshold: None,

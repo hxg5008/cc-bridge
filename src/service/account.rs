@@ -18,6 +18,31 @@ use crate::store::cache::CacheStore;
 const STICKY_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const OAUTH_REFRESH_BUFFER_SECONDS: i64 = 5 * 60;
 const OAUTH_LOCK_TTL: Duration = Duration::from_secs(30);
+
+/// 账号在 dashboard / 卡片上显示的分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountCategory {
+    /// 当前完全可调度 (status=active + 无 auth_error + LimitStore 全过)。
+    Available,
+    /// 暂时撞上游限流, 会自动恢复 (5h/7d 窗口满 / 短期 ban / RPM-TPM 预抢 / 全局 Rejected)。
+    RateLimited,
+    /// Token 失效 (status=active 但有 auth_error, 或 status=error)。需要人工重新授权。
+    Invalid,
+    /// 上游官方封禁 (status=disabled + reason 含 403/认证失败/violation)。
+    Banned,
+    /// 管理员手动停用 (status=disabled 但非"封禁"判定)。
+    Stopped,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountCategorization {
+    pub category: AccountCategory,
+    /// 给 UI 显示的子原因文字 (例如 "5 小时窗口已用 100.0%" / "手动停用" / token 错误信息)。
+    pub reason: String,
+    /// 该状态预计恢复时刻 (限流中才有, 用于 UI 倒计时)。
+    pub recovers_at: Option<chrono::DateTime<chrono::Utc>>,
+}
 const OAUTH_WAIT_RETRY: Duration = Duration::from_millis(500);
 const OAUTH_WAIT_ATTEMPTS: usize = 20;
 
@@ -366,6 +391,96 @@ impl AccountService {
     /// 通过 admin 按钮手动调用此方法。返回布尔表示是否真的清了什么。
     pub fn clear_limit_runtime_flags(&self, id: i64) -> bool {
         self.limit_store.clear_runtime_flags(id)
+    }
+
+    /// 当前内存里仍有效的短期限流截止时间 (UI 用, 倒计时显示)。
+    pub fn peek_rate_limited_until(
+        &self,
+        id: i64,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.limit_store.peek_rate_limited_until(id)
+    }
+
+    /// 把账号映射到 5 类用户视角的状态。优先级（高 → 低）：
+    /// 封禁 / 停用 > 失效 > 限流中 > 可用。返回的 reason 给 UI 展示用。
+    pub fn categorize(&self, account: &Account) -> AccountCategorization {
+        use crate::model::account::AccountStatus;
+
+        // 1. status=disabled → 封禁 vs 停用 (按 disable_reason 文本区分)
+        if account.status == AccountStatus::Disabled {
+            let reason = account.disable_reason.as_str();
+            // 与 gateway.rs 写入的字面量保持一致: "403 认证失败"
+            let is_banned = reason.contains("403")
+                || reason.contains("认证失败")
+                || reason.to_lowercase().contains("violation")
+                || reason.to_lowercase().contains("forbidden");
+            if is_banned {
+                return AccountCategorization {
+                    category: AccountCategory::Banned,
+                    reason: if reason.is_empty() {
+                        "上游已封禁".into()
+                    } else {
+                        reason.to_string()
+                    },
+                    recovers_at: None,
+                };
+            }
+            return AccountCategorization {
+                category: AccountCategory::Stopped,
+                reason: if reason.is_empty() {
+                    "已停用".into()
+                } else {
+                    reason.to_string()
+                },
+                recovers_at: None,
+            };
+        }
+
+        // 2. status=error 在当前实现里几乎不写,但为完整性保留——视作失效。
+        if account.status == AccountStatus::Error {
+            return AccountCategorization {
+                category: AccountCategory::Invalid,
+                reason: if account.auth_error.is_empty() {
+                    "状态异常".into()
+                } else {
+                    account.auth_error.clone()
+                },
+                recovers_at: None,
+            };
+        }
+
+        // status=active 之后的判定:
+        // 3. auth_error 非空 → 失效 (token 失效, 需人工处理)
+        if !account.auth_error.is_empty() {
+            return AccountCategorization {
+                category: AccountCategory::Invalid,
+                reason: account.auth_error.clone(),
+                recovers_at: None,
+            };
+        }
+
+        // 4. LimitStore 内存判定 → 限流中
+        match self.limit_store.availability(account.id) {
+            crate::service::limit::Availability::Unavailable { reason, until } => {
+                AccountCategorization {
+                    category: AccountCategory::RateLimited,
+                    reason,
+                    recovers_at: until,
+                }
+            }
+            crate::service::limit::Availability::Available => {
+                // 4b. 内存空 → 回退看 DB usage_data (启动后 hydrate 失败 / 老数据等场景兜底)
+                if let Some(cat) = categorize_from_db_usage(&account.usage_data) {
+                    return cat;
+                }
+                // 5. 全部检查通过
+                AccountCategorization {
+                    category: AccountCategory::Available,
+                    reason: String::new(),
+                    recovers_at: None,
+                }
+            }
+        }
     }
 
     pub async fn refresh_usage(&self, id: i64) -> Result<serde_json::Value, AppError> {
@@ -732,6 +847,43 @@ fn normalize_account_auth(account: &mut Account) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+/// DB usage_data fallback 判定: LimitStore 内存空时, 仍然能从 DB 读出 5h/7d
+/// utilization 来分类。返回 Some(限流分类) 或 None(健康/无数据视为可用)。
+fn categorize_from_db_usage(usage: &serde_json::Value) -> Option<AccountCategorization> {
+    let obj = usage.as_object()?;
+    let now = chrono::Utc::now();
+
+    fn read_window(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<(f64, chrono::DateTime<chrono::Utc>)> {
+        let w = obj.get(key)?.as_object()?;
+        // utilization 在 DB 里是 0-100 刻度 (build_usage_json 写入时乘了 100)
+        let pct = w.get("utilization").and_then(|v| v.as_f64())?;
+        let resets = w.get("resets_at").and_then(|v| v.as_str())?;
+        let t = chrono::DateTime::parse_from_rfc3339(resets).ok()?.with_timezone(&chrono::Utc);
+        Some((pct / 100.0, t))
+    }
+
+    // 命中阈值: utilization 必须达到 100% 且 resets_at 在未来
+    if let Some((u, t)) = read_window(obj, "five_hour") {
+        if u >= 1.0 && t > now {
+            return Some(AccountCategorization {
+                category: AccountCategory::RateLimited,
+                reason: format!("5 小时窗口已用 {:.1}%", u * 100.0),
+                recovers_at: Some(t),
+            });
+        }
+    }
+    if let Some((u, t)) = read_window(obj, "seven_day") {
+        if u >= 1.0 && t > now {
+            return Some(AccountCategorization {
+                category: AccountCategory::RateLimited,
+                reason: format!("7 天窗口已用 {:.1}%", u * 100.0),
+                recovers_at: Some(t),
+            });
+        }
+    }
+    None
 }
 
 /// 根据客户端类型创建会话哈希。

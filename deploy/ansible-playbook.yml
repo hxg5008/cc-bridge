@@ -20,7 +20,7 @@
   hosts: cc-bridge
   become: yes
   vars:
-    repo: "YOUR_GH_USER/cc-bridge"
+    repo: "hxg5008/cc-bridge"
     install_dir: "/opt/cc-bridge"
     service_user: "ccbridge"
     service_name: "cc-bridge"
@@ -154,7 +154,9 @@
             cat > {{ install_dir }}/.env <<EOF
         SERVER_HOST=127.0.0.1
         SERVER_PORT=5674
-        DATABASE_DRIVER=sqlite
+        DATABASE_DRIVER=postgres
+        # 部署前需准备 PostgreSQL，并填上 DATABASE_DSN
+        # DATABASE_DSN=postgres://cc-bridge:cc-bridge@127.0.0.1:5432/cc-bridge?sslmode=disable
         ADMIN_PASSWORD=$ADMIN_PWD
         LOG_LEVEL=info
         EOF

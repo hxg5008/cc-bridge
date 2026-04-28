@@ -15,11 +15,10 @@ use serde_json::Value;
 
 use crate::model::account::Account;
 
-/// 5h / 7d 窗口已用百分比超过这个值视为账号"满"。
+/// 5h / 7d 窗口已用百分比达到此值即视为账号"满"。
 ///
-/// 与 sub2api Claude `LimitStore` 5h/7d 阈值保持一致 (97%) — Codex CLI 自己显示到
-/// 100% 才提示,留 3% 头空间避免大查询撑爆。
-pub const CODEX_HARD_CAP_PERCENT: f64 = 97.0;
+/// 取 100% = 真正撞墙才挡（避免 97-99% 误挡）。与 Claude 的 HIT_THRESHOLD 1.0 对齐。
+pub const CODEX_HARD_CAP_PERCENT: f64 = 100.0;
 
 /// 上游没给 `Retry-After` 头时,默认冷却 60 秒。
 pub const DEFAULT_429_COOLDOWN_SECONDS: i64 = 60;
@@ -157,6 +156,7 @@ mod tests {
             disable_reason: String::new(),
             auto_telemetry: false,
             telemetry_count: 0,
+            experimental_reveal_thinking: false,
             usage_data: json!({}),
             usage_fetched_at: None,
             platform: "openai".into(),
@@ -188,7 +188,7 @@ mod tests {
     fn five_hour_full_blocks() {
         let now = Utc::now().timestamp();
         let a = account_with_extra(json!({
-            "codex_usage_5h_used_percent": 99.0,
+            "codex_usage_5h_used_percent": 100.0,
             "codex_usage_5h_reset_at": now + 600,
         }));
         assert!(!openai_schedulable(&a));
@@ -198,7 +198,7 @@ mod tests {
     fn seven_day_full_blocks() {
         let now = Utc::now().timestamp();
         let a = account_with_extra(json!({
-            "codex_usage_7d_used_percent": 97.5,
+            "codex_usage_7d_used_percent": 100.0,
             "codex_usage_7d_reset_at": now + 86400,
         }));
         assert!(!openai_schedulable(&a));
@@ -208,7 +208,7 @@ mod tests {
     fn already_reset_does_not_block() {
         let now = Utc::now().timestamp();
         let a = account_with_extra(json!({
-            "codex_usage_5h_used_percent": 99.0,
+            "codex_usage_5h_used_percent": 100.0,
             "codex_usage_5h_reset_at": now - 60,
         }));
         assert!(openai_schedulable(&a));
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn missing_reset_with_full_percent_treated_as_blocked() {
         // 防御性: 数据残缺(没 reset_at)但已知到顶,不要冒险派单
-        let a = account_with_extra(json!({"codex_usage_5h_used_percent": 99.0}));
+        let a = account_with_extra(json!({"codex_usage_5h_used_percent": 100.0}));
         assert!(!openai_schedulable(&a));
     }
 }

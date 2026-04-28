@@ -59,9 +59,18 @@ export interface Account {
   experimental_reveal_thinking?: boolean
   rate_limited_at?: string
   rate_limit_reset_at?: string
+  /** 内存里仍有效的短期限流截止时间 (RFC3339); 只在 dashboard 倒计时显示用,不持久化。
+   *  当不为 null 时 → 该账号目前被 LimitStore 软挡, 调度器不会派发新请求。 */
+  rate_limited_until_runtime?: string
   disable_reason?: string
   usage_data?: UsageData
   usage_fetched_at?: string
+  /** 5 类用户视角分类（后端 categorize 返回） */
+  category?: AccountCategory
+  /** 该状态的子原因 (限流原因 / 停用原因 / 失效错误信息), 给 UI 显示用 */
+  category_reason?: string
+  /** 限流类账号预计恢复时刻 RFC3339 */
+  category_recovers_at?: string
   created_at: string
   updated_at: string
 }
@@ -117,13 +126,30 @@ export interface ApiToken {
 export interface Dashboard {
   accounts: {
     total: number;
+    /** 旧字段（DB.status 计数）— 兼容老前端 */
     active: number;
     error: number;
     disabled: number;
     by_platform?: Record<string, number>;
+    /** 新分类（5 类用户视角） */
+    available?: number;
+    rate_limited?: number;
+    invalid?: number;
+    banned?: number;
+    stopped?: number;
+    /** 可调度比例: available / total (0.0 ~ 1.0) */
+    schedulable_pct?: number;
   };
   tokens: number;
 }
+
+/** 与后端 AccountCategory 对应（snake_case） */
+export type AccountCategory =
+  | 'available'
+  | 'rate_limited'
+  | 'invalid'
+  | 'banned'
+  | 'stopped';
 
 export interface OAuthGenerateResult {
   auth_url: string;
@@ -165,6 +191,13 @@ export const api = {
   deleteAccount: (id: number) => request<void>('DELETE', `/admin/accounts/${id}`),
   testAccount: (id: number) => request<{ status: string; message?: string }>('POST', `/admin/accounts/${id}/test`),
   refreshUsage: (id: number) => request<{ status: string; usage?: UsageData; message?: string }>('POST', `/admin/accounts/${id}/usage`),
+  /** 批量刷新所有 OAuth 账号用量。后端走每账号 60s 缓存,频繁调不会真打上游。 */
+  refreshAllUsage: () => request<{ status: string; ok: number; skipped: number; failed: number; errors: any[] }>(
+    'POST', '/admin/accounts/refresh-all-usage'
+  ),
+  /** 手动清除内存里残留的短期限流标记 (rate_limited_until / status=Rejected)。
+   *  典型用法: dashboard 显示账号用量正常但调度器仍持续过滤该账号 (死锁场景)。 */
+  clearLimit: (id: number) => request<{ status: string; cleared: boolean }>('POST', `/admin/accounts/${id}/clear_limit`),
   listTokens: (page = 1, pageSize = 20) =>
     request<PagedResult<ApiToken>>('GET', `/admin/tokens?page=${page}&page_size=${pageSize}`),
   createToken: (t: Partial<ApiToken>) => request<ApiToken>('POST', '/admin/tokens', t),

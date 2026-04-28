@@ -1,62 +1,82 @@
 services:
   cc-bridge:
-    image: ghcr.io/YOUR_GH_USER/cc-bridge:latest
+    # 镜像由 GitHub Actions (release.yml) 自动构建并推送到 ghcr.io。
+    # 服务器只 pull 不构建,2 核机也秒级完成。
+    # 如需本地构建调试,运行: docker compose up -d --build (会用下方 build: 段)
+    image: ghcr.io/hxg5008/cc-bridge:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
     container_name: cc-bridge
     env_file:
       - .env
     ports:
       - "${SERVER_PORT:-5674}:5674"
-    volumes:
-      - cc-bridge-data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
-  # postgres:
-  #   image: postgres:17-alpine
-  #   container_name: cc-bridge-postgres
-  #   env_file:
-  #     - .env
-  #   ports:
-  #     - "${DATABASE_PORT:-5432}:5432"
-  #   volumes:
-  #     - postgres-data:/var/lib/postgresql/data
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
-  #     interval: 5s
-  #     timeout: 5s
-  #     retries: 12
-  #   restart: unless-stopped
+  postgres:
+    image: postgres:18-alpine
+    container_name: cc-bridge-postgres
+    env_file:
+      - .env
+    ports:
+      - "${DATABASE_PORT:-5432}:5432"
+    ulimits:
+      nofile:
+        soft: 100000
+        hard: 100000
+    environment:
+      # postgres:18-alpine 默认 PGDATA=/var/lib/postgresql/18/docker（位于镜像声明的匿名卷
+      # /var/lib/postgresql 内）。若不显式设置 PGDATA，则即使挂载了 postgres-data 到
+      # /var/lib/postgresql/data，数据也不会落盘到该命名卷，docker compose down/up 后会触发
+      # initdb 重新初始化，导致用户/账号/token 全部丢失。
+      - PGDATA=/var/lib/postgresql/data
+      - TZ=${TZ:-Asia/Shanghai}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
 
-  # redis:
-  #   image: redis:7-alpine
-  #   container_name: cc-bridge-redis
-  #   profiles: ["redis"]
-  #   env_file:
-  #     - .env
-  #   command:
-  #     - sh
-  #     - -c
-  #     - |
-  #       if [ -n "$$REDIS_PASSWORD" ]; then
-  #         exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD";
-  #       fi
-  #       exec redis-server --appendonly yes;
-  #   volumes:
-  #     - redis-data:/data
-  #   healthcheck:
-  #     test:
-  #       - CMD-SHELL
-  #       - |
-  #         if [ -n "$$REDIS_PASSWORD" ]; then
-  #           redis-cli -a "$$REDIS_PASSWORD" ping;
-  #         else
-  #           redis-cli ping;
-  #         fi
-  #     interval: 5s
-  #     timeout: 5s
-  #     retries: 12
-  #   restart: unless-stopped
+  # Redis 仅在多副本部署 / 需要跨进程粘性会话时启用。
+  # 启用方式：docker compose --profile redis up -d
+  # 同时在 .env 设 REDIS_HOST=redis
+  redis:
+    image: redis:7-alpine
+    container_name: cc-bridge-redis
+    profiles: ["redis"]
+    env_file:
+      - .env
+    command:
+      - sh
+      - -c
+      - |
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD";
+        fi
+        exec redis-server --appendonly yes;
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          if [ -n "$$REDIS_PASSWORD" ]; then
+            redis-cli -a "$$REDIS_PASSWORD" ping;
+          else
+            redis-cli ping;
+          fi
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
 
 volumes:
-  cc-bridge-data:
   postgres-data:
   redis-data:

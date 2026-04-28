@@ -14,15 +14,13 @@ const SCHEDULABLE_TTL: Duration = Duration::from_secs(30);
 
 pub struct AccountStore {
     pool: AnyPool,
-    driver: String,
     schedulable_cache: Arc<RwLock<Option<(Instant, Vec<Account>)>>>,
 }
 
 impl AccountStore {
-    pub fn new(pool: AnyPool, driver: String) -> Self {
+    pub fn new(pool: AnyPool) -> Self {
         Self {
             pool,
-            driver,
             schedulable_cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -52,15 +50,7 @@ impl AccountStore {
     }
 
     fn now_expr(&self) -> &str {
-        if self.driver == "sqlite" {
-            "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
-        } else {
-            "NOW()"
-        }
-    }
-
-    fn is_pg(&self) -> bool {
-        self.driver == "postgres"
+        "NOW()"
     }
 
     fn fmt_time(&self, t: DateTime<Utc>) -> String {
@@ -71,31 +61,19 @@ impl AccountStore {
     /// all NULLs as `Option::<i32>::None` / INT4 type OID. The explicit `::TEXT`
     /// cast makes the INT4→TEXT conversion succeed before assignment to a TEXT column.
     fn nullable(&self, n: u32) -> String {
-        if self.is_pg() {
-            format!("${}::TEXT", n)
-        } else {
-            format!("${}", n)
-        }
+        format!("${}::TEXT", n)
     }
 
     /// Like `nullable()` but for TIMESTAMPTZ columns. Uses `$N::TEXT::TIMESTAMPTZ`
     /// for Postgres because TEXT has no implicit assignment cast to TIMESTAMPTZ.
     fn nullable_ts(&self, n: u32) -> String {
-        if self.is_pg() {
-            format!("${}::TEXT::TIMESTAMPTZ", n)
-        } else {
-            format!("${}", n)
-        }
+        format!("${}::TEXT::TIMESTAMPTZ", n)
     }
 
     /// Returns `$N::JSONB` for Postgres. The Any driver sends String as TEXT type,
     /// but TEXT has no implicit assignment cast to JSONB.
     fn jsonb(&self, n: u32) -> String {
-        if self.is_pg() {
-            format!("${}::JSONB", n)
-        } else {
-            format!("${}", n)
-        }
+        format!("${}::JSONB", n)
     }
 
     fn parse_datetime_str(s: &str) -> Option<DateTime<Utc>> {
@@ -146,19 +124,11 @@ impl AccountStore {
     }
 
     fn select_account_cols(&self) -> &'static str {
-        if self.is_pg() {
-            ACCOUNT_COLS_PG_TEXT
-        } else {
-            ACCOUNT_COLS
-        }
+        ACCOUNT_COLS_PG_TEXT
     }
 
     fn returning_account_timestamps(&self) -> &'static str {
-        if self.is_pg() {
-            "id, created_at::text AS created_at, updated_at::text AS updated_at"
-        } else {
-            "id, created_at, updated_at"
-        }
+        "id, created_at::text AS created_at, updated_at::text AS updated_at"
     }
 
     fn row_to_account(row: &AnyRow) -> Account {
@@ -595,14 +565,6 @@ impl AccountStore {
     }
 }
 
-const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_token, refresh_token,
-    oauth_expires_at, oauth_refreshed_at, auth_error, proxy_url, device_id,
-    canonical_env, canonical_prompt_env, canonical_process,
-    billing_mode, account_uuid, organization_uuid, subscription_type,
-    concurrency, priority, rate_limited_at, rate_limit_reset_at,
-    disable_reason, auto_telemetry, telemetry_count, experimental_reveal_thinking,
-    usage_data, usage_fetched_at, platform, extra, created_at, updated_at"#;
-
 const ACCOUNT_COLS_PG_TEXT: &str = r#"id, name, email, status, token, auth_type, access_token, refresh_token,
     oauth_expires_at::text AS oauth_expires_at, oauth_refreshed_at::text AS oauth_refreshed_at,
     auth_error, proxy_url, device_id,
@@ -620,49 +582,8 @@ const ACCOUNT_COLS_PG_TEXT: &str = r#"id, name, email, status, token, auth_type,
 mod tests {
     use super::*;
 
-    async fn make_store(driver: &str) -> AccountStore {
-        sqlx::any::install_default_drivers();
-        let tmp = std::env::temp_dir().join(format!("ccgw_unit_{}.db", rand::random::<u64>()));
-        let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
-        let pool = AnyPool::connect(&dsn).await.expect("pool");
-        AccountStore {
-            pool,
-            driver: driver.to_string(),
-            schedulable_cache: Arc::new(RwLock::new(None)),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_is_pg() {
-        assert!(make_store("postgres").await.is_pg());
-        assert!(!make_store("sqlite").await.is_pg());
-    }
-
-    #[tokio::test]
-    async fn test_now_expr_sqlite() {
-        let store = make_store("sqlite").await;
-        assert_eq!(store.now_expr(), "strftime('%Y-%m-%dT%H:%M:%SZ','now')");
-    }
-
-    #[tokio::test]
-    async fn test_now_expr_postgres() {
-        let store = make_store("postgres").await;
-        assert_eq!(store.now_expr(), "NOW()");
-    }
-
-    #[tokio::test]
-    async fn test_fmt_time_iso8601() {
-        let store = make_store("sqlite").await;
-        let t = chrono::NaiveDate::from_ymd_opt(2026, 4, 9)
-            .unwrap()
-            .and_hms_opt(12, 30, 45)
-            .unwrap()
-            .and_utc();
-        assert_eq!(store.fmt_time(t), "2026-04-09T12:30:45Z");
-    }
-
     #[test]
-    fn test_parse_datetime_str_sqlite_iso8601() {
+    fn test_parse_datetime_str_iso8601() {
         let parsed = AccountStore::parse_datetime_str("2026-04-09T12:30:45Z").unwrap();
         let expected = chrono::NaiveDate::from_ymd_opt(2026, 4, 9)
             .unwrap()
@@ -684,61 +605,5 @@ mod tests {
         let parsed = AccountStore::parse_datetime_str("2026-04-09 12:30:45.123456+00:00").unwrap();
         assert_eq!(parsed.timestamp(), 1775737845);
         assert_eq!(parsed.timestamp_subsec_micros(), 123456);
-    }
-
-    // ─── nullable_ts() helper ───
-
-    #[tokio::test]
-    async fn test_nullable_ts_sqlite() {
-        let store = make_store("sqlite").await;
-        assert_eq!(store.nullable_ts(3), "$3");
-    }
-
-    #[tokio::test]
-    async fn test_nullable_ts_postgres() {
-        let store = make_store("postgres").await;
-        assert_eq!(store.nullable_ts(3), "$3::TEXT::TIMESTAMPTZ");
-    }
-
-    // ─── jsonb() helper ───
-
-    #[tokio::test]
-    async fn test_jsonb_sqlite() {
-        let store = make_store("sqlite").await;
-        assert_eq!(store.jsonb(1), "$1");
-    }
-
-    #[tokio::test]
-    async fn test_jsonb_postgres() {
-        let store = make_store("postgres").await;
-        assert_eq!(store.jsonb(1), "$1::JSONB");
-    }
-
-    // ─── nullable() helper ───
-
-    #[tokio::test]
-    async fn test_nullable_sqlite() {
-        let store = make_store("sqlite").await;
-        assert_eq!(store.nullable(5), "$5");
-    }
-
-    #[tokio::test]
-    async fn test_nullable_postgres() {
-        let store = make_store("postgres").await;
-        assert_eq!(store.nullable(5), "$5::TEXT");
-    }
-
-    // ─── select_account_cols() ───
-
-    #[tokio::test]
-    async fn test_select_account_cols_sqlite() {
-        let store = make_store("sqlite").await;
-        assert_eq!(store.select_account_cols(), ACCOUNT_COLS);
-    }
-
-    #[tokio::test]
-    async fn test_select_account_cols_postgres() {
-        let store = make_store("postgres").await;
-        assert_eq!(store.select_account_cols(), ACCOUNT_COLS_PG_TEXT);
     }
 }

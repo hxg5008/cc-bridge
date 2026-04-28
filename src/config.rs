@@ -53,7 +53,13 @@ pub struct AdminConfig {
 
 impl DatabaseConfig {
     pub fn driver(&self) -> String {
-        self.driver.clone().unwrap_or_else(|| "sqlite".into())
+        match self.driver.as_deref().map(|s| s.trim()) {
+            None | Some("") | Some("postgres") => "postgres".into(),
+            Some(other) => panic!(
+                "DATABASE_DRIVER='{}' 已不再支持。SQLite 已下线，请使用 PostgreSQL（默认 driver=postgres，参考 .env.example）",
+                other
+            ),
+        }
     }
 
     pub fn has_explicit_dsn(&self) -> bool {
@@ -66,9 +72,6 @@ impl DatabaseConfig {
     pub fn dsn(&self) -> String {
         if let Some(dsn) = self.dsn.as_ref().filter(|dsn| !dsn.trim().is_empty()) {
             return dsn.clone();
-        }
-        if self.driver() == "sqlite" {
-            return "data/claude-code-gateway.db".into();
         }
         format!(
             "postgres://{}:{}@{}:{}/{}?sslmode=disable",

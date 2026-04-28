@@ -84,6 +84,7 @@ pub fn build_router(
         )
         .route("/admin/accounts/:id/test", post(test_account))
         .route("/admin/accounts/:id/usage", post(refresh_usage))
+        .route("/admin/accounts/refresh-all-usage", post(refresh_all_usage))
         .route("/admin/accounts/:id/clear_limit", post(clear_limit_state))
         .route("/admin/tokens", get(list_tokens).post(create_token))
         .route(
@@ -578,7 +579,7 @@ async fn list_accounts(
         .await?;
     let total_pages = (total + page_size - 1) / page_size;
 
-    // 为每个账号附加遥测会话过期时间
+    // 为每个账号附加遥测会话过期时间 + 内存限流倒计时 + 分类
     let mut data: Vec<serde_json::Value> = Vec::with_capacity(accounts.len());
     for a in &accounts {
         let mut obj = serde_json::to_value(a).unwrap_or_default();
@@ -587,6 +588,19 @@ async fn list_accounts(
         }
         obj["current_concurrency"] =
             serde_json::json!(state.account_svc.peek_concurrency(a.id).await);
+        // 内存里仍有效的短期 ban 截止时间（dashboard 上显示倒计时 + "清除限流"按钮提示用）
+        if let Some(until) = state.account_svc.peek_rate_limited_until(a.id) {
+            obj["rate_limited_until_runtime"] = serde_json::json!(until.to_rfc3339());
+        }
+        // 5 类用户视角分类（前端徽章 + 筛选用）
+        let cat = state.account_svc.categorize(a);
+        obj["category"] = serde_json::to_value(cat.category).unwrap_or_default();
+        if !cat.reason.is_empty() {
+            obj["category_reason"] = serde_json::json!(cat.reason);
+        }
+        if let Some(t) = cat.recovers_at {
+            obj["category_recovers_at"] = serde_json::json!(t.to_rfc3339());
+        }
         data.push(obj);
     }
 
@@ -914,6 +928,8 @@ async fn test_account(
             match client
                 .get(&url)
                 .header("Authorization", format!("Bearer {}", token))
+                // identity 防止上游回 gzip (reqwest 没启 gzip feature, .text() 会读到压缩字节乱码)
+                .header("accept-encoding", "identity")
                 .send()
                 .await
             {
@@ -968,6 +984,56 @@ async fn refresh_usage(
             ))
         }
     }
+}
+
+/// POST /admin/accounts/refresh-all-usage — 批量刷新所有 OAuth 账号的用量。
+///
+/// 设计:
+/// - 仅遍历 `auth_type=oauth` 的活跃账号 (SetupToken 没有 /api/oauth/usage 端点)
+/// - 单账号走 `refresh_usage()` 内部 60s DB 缓存 + 60s 429 cooldown,
+///   所以频繁调用此 endpoint 不会真打上游 (Anthropic /api/oauth/usage 限频很严)
+/// - 失败的账号不阻塞其他账号 (单条 catch + 计数返回)
+/// - 串行执行避免对上游瞬时打太多并发
+async fn refresh_all_usage(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let accounts = state.account_svc.list_accounts().await?;
+    let mut ok_count = 0i32;
+    let mut skipped = 0i32;
+    let mut failed = 0i32;
+    let mut errors: Vec<serde_json::Value> = Vec::new();
+
+    for a in &accounts {
+        if a.status != AccountStatus::Active {
+            skipped += 1;
+            continue;
+        }
+        if a.auth_type != AccountAuthType::Oauth {
+            skipped += 1;
+            continue;
+        }
+        match state.account_svc.refresh_usage(a.id).await {
+            Ok(_) => ok_count += 1,
+            Err(e) => {
+                failed += 1;
+                if errors.len() < 5 {
+                    errors.push(serde_json::json!({
+                        "id": a.id,
+                        "email": a.email,
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "ok": ok_count,
+        "skipped": skipped,
+        "failed": failed,
+        "errors": errors,
+    })))
 }
 
 /// 手动清除指定账号的内存软限流标记（rate_limited_until / status=Rejected）。
@@ -1069,13 +1135,25 @@ async fn delete_token_handler(
 // --- Dashboard ---
 
 async fn get_dashboard(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::service::account::AccountCategory;
+
     let accounts = state.account_svc.list_accounts().await?;
     let token_count = state.token_store.count().await.unwrap_or(0);
 
+    // 旧字段（为兼容老前端，保留）
     let mut active = 0;
     let mut err_count = 0;
     let mut disabled = 0;
+
+    // 新分类计数（5 类用户视角分类）
+    let mut available = 0i64;
+    let mut rate_limited = 0i64;
+    let mut invalid = 0i64;
+    let mut banned = 0i64;
+    let mut stopped = 0i64;
+
     let mut by_platform: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
     for a in &accounts {
         match a.status {
             AccountStatus::Active => active += 1,
@@ -1088,15 +1166,38 @@ async fn get_dashboard(State(state): State<AppState>) -> Result<Json<serde_json:
             a.platform.clone()
         };
         *by_platform.entry(key).or_insert(0) += 1;
+
+        match state.account_svc.categorize(a).category {
+            AccountCategory::Available => available += 1,
+            AccountCategory::RateLimited => rate_limited += 1,
+            AccountCategory::Invalid => invalid += 1,
+            AccountCategory::Banned => banned += 1,
+            AccountCategory::Stopped => stopped += 1,
+        }
     }
+
+    let total = accounts.len() as f64;
+    let schedulable_pct = if total > 0.0 {
+        (available as f64) / total
+    } else {
+        0.0
+    };
 
     Ok(Json(serde_json::json!({
         "accounts": {
             "total": accounts.len(),
+            // 旧字段保留 (DB.status 计数)
             "active": active,
             "error": err_count,
             "disabled": disabled,
             "by_platform": by_platform,
+            // 新分类（5 类）
+            "available": available,
+            "rate_limited": rate_limited,
+            "invalid": invalid,
+            "banned": banned,
+            "stopped": stopped,
+            "schedulable_pct": schedulable_pct,
         },
         "tokens": token_count,
     })))

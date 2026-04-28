@@ -10,29 +10,13 @@ use tracing::info;
 
 const SCHEMA_VERSION: i32 = 2;
 
-pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
-    if driver == "sqlite" {
-        if let Some(parent) = Path::new(dsn).parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let pool = AnyPool::connect(&format!("sqlite:{}?mode=rwc", dsn)).await?;
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query("PRAGMA foreign_keys=ON")
-            .execute(&pool)
-            .await
-            .ok();
-        Ok(pool)
-    } else {
-        let pool = AnyPool::connect(dsn).await?;
-        Ok(pool)
-    }
+pub async fn init_db(dsn: &str) -> Result<AnyPool, sqlx::Error> {
+    let pool = AnyPool::connect(dsn).await?;
+    Ok(pool)
 }
 
 pub async fn ensure_postgres_database(cfg: &DatabaseConfig) -> Result<(), String> {
-    if cfg.driver() != "postgres" || cfg.has_explicit_dsn() {
+    if cfg.has_explicit_dsn() {
         return Ok(());
     }
 
@@ -47,7 +31,7 @@ pub async fn ensure_postgres_database(cfg: &DatabaseConfig) -> Result<(), String
     Ok(())
 }
 
-pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
+pub async fn migrate(pool: &AnyPool) -> Result<(), sqlx::Error> {
     // Fast path: if schema_migrations records the current version, skip everything.
     sqlx::query("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
         .execute(pool)
@@ -63,12 +47,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         return Ok(());
     }
 
-    let schema = if driver == "sqlite" {
-        SQLITE_SCHEMA
-    } else {
-        PG_SCHEMA
-    };
-    for stmt in schema.split(';') {
+    for stmt in PG_SCHEMA.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
             continue;
@@ -77,12 +56,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     }
 
     // api_tokens 表 — create before column-existence probing so both tables are present.
-    let token_schema = if driver == "sqlite" {
-        SQLITE_TOKENS_SCHEMA
-    } else {
-        PG_TOKENS_SCHEMA
-    };
-    for stmt in token_schema.split(';') {
+    for stmt in PG_TOKENS_SCHEMA.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
             continue;
@@ -93,85 +67,83 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     // 增量迁移 — only ALTER columns that are actually missing, so remote-DB startups
     // don't pay ~20 round-trips for ALTERs that would otherwise fail with "column
     // already exists" and get swallowed by .ok().
-    let ts_type = if driver == "sqlite" { "TEXT" } else { "TIMESTAMPTZ" };
-    let json_type = if driver == "sqlite" { "TEXT" } else { "JSONB" };
-    let cols = existing_columns(pool, driver, "accounts").await;
+    let cols = existing_columns(pool, "accounts").await;
 
-    let pending: [(&str, String); 18] = [
+    let pending: [(&str, &str); 18] = [
         (
             "billing_mode",
-            "ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'".into(),
+            "ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'",
         ),
         (
             "usage_data",
-            format!("ALTER TABLE accounts ADD COLUMN usage_data {} NOT NULL DEFAULT '{{}}'", json_type),
+            "ALTER TABLE accounts ADD COLUMN usage_data JSONB NOT NULL DEFAULT '{}'",
         ),
         (
             "usage_fetched_at",
-            format!("ALTER TABLE accounts ADD COLUMN usage_fetched_at {}", ts_type),
+            "ALTER TABLE accounts ADD COLUMN usage_fetched_at TIMESTAMPTZ",
         ),
         (
             "auth_type",
-            "ALTER TABLE accounts ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'setup_token'".into(),
+            "ALTER TABLE accounts ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'setup_token'",
         ),
         (
             "access_token",
-            "ALTER TABLE accounts ADD COLUMN access_token TEXT NOT NULL DEFAULT ''".into(),
+            "ALTER TABLE accounts ADD COLUMN access_token TEXT NOT NULL DEFAULT ''",
         ),
         (
             "refresh_token",
-            "ALTER TABLE accounts ADD COLUMN refresh_token TEXT NOT NULL DEFAULT ''".into(),
+            "ALTER TABLE accounts ADD COLUMN refresh_token TEXT NOT NULL DEFAULT ''",
         ),
         (
             "oauth_expires_at",
-            format!("ALTER TABLE accounts ADD COLUMN oauth_expires_at {}", ts_type),
+            "ALTER TABLE accounts ADD COLUMN oauth_expires_at TIMESTAMPTZ",
         ),
         (
             "oauth_refreshed_at",
-            format!("ALTER TABLE accounts ADD COLUMN oauth_refreshed_at {}", ts_type),
+            "ALTER TABLE accounts ADD COLUMN oauth_refreshed_at TIMESTAMPTZ",
         ),
         (
             "auth_error",
-            "ALTER TABLE accounts ADD COLUMN auth_error TEXT NOT NULL DEFAULT ''".into(),
+            "ALTER TABLE accounts ADD COLUMN auth_error TEXT NOT NULL DEFAULT ''",
         ),
         (
             "account_uuid",
-            "ALTER TABLE accounts ADD COLUMN account_uuid TEXT".into(),
+            "ALTER TABLE accounts ADD COLUMN account_uuid TEXT",
         ),
         (
             "organization_uuid",
-            "ALTER TABLE accounts ADD COLUMN organization_uuid TEXT".into(),
+            "ALTER TABLE accounts ADD COLUMN organization_uuid TEXT",
         ),
         (
             "subscription_type",
-            "ALTER TABLE accounts ADD COLUMN subscription_type TEXT".into(),
+            "ALTER TABLE accounts ADD COLUMN subscription_type TEXT",
         ),
         (
             "disable_reason",
-            "ALTER TABLE accounts ADD COLUMN disable_reason TEXT NOT NULL DEFAULT ''".into(),
+            "ALTER TABLE accounts ADD COLUMN disable_reason TEXT NOT NULL DEFAULT ''",
         ),
         (
             "auto_telemetry",
-            "ALTER TABLE accounts ADD COLUMN auto_telemetry INTEGER NOT NULL DEFAULT 0".into(),
+            "ALTER TABLE accounts ADD COLUMN auto_telemetry INTEGER NOT NULL DEFAULT 0",
         ),
         (
             "telemetry_count",
-            "ALTER TABLE accounts ADD COLUMN telemetry_count INTEGER NOT NULL DEFAULT 0".into(),
+            "ALTER TABLE accounts ADD COLUMN telemetry_count INTEGER NOT NULL DEFAULT 0",
         ),
         // Phase 1 (multi-platform): 加 platform 字段, 默认 claude (向后兼容现有账号)
         (
             "platform",
-            "ALTER TABLE accounts ADD COLUMN platform TEXT NOT NULL DEFAULT 'claude'".into(),
+            "ALTER TABLE accounts ADD COLUMN platform TEXT NOT NULL DEFAULT 'claude'",
         ),
         // Phase 1: 加 extra JSONB 字段, 平台特有数据 (openai_passthrough / ua_override 等)
         (
             "extra",
-            format!("ALTER TABLE accounts ADD COLUMN extra {} NOT NULL DEFAULT '{{}}'", json_type),
+            "ALTER TABLE accounts ADD COLUMN extra JSONB NOT NULL DEFAULT '{}'",
         ),
         // 上游 v1.8.6: experimental_reveal_thinking per-account toggle
         (
             "experimental_reveal_thinking",
-            "ALTER TABLE accounts ADD COLUMN experimental_reveal_thinking INTEGER NOT NULL DEFAULT 0".into(),
+            "ALTER TABLE accounts ADD COLUMN experimental_reveal_thinking INTEGER NOT NULL DEFAULT 0",
         ),
     ];
     for (name, sql) in pending.iter() {
@@ -182,38 +154,36 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
 
     // Fix column types for existing PG databases that may have TEXT instead of TIMESTAMPTZ/JSONB.
     // Only run when the current data_type doesn't already match.
-    if driver != "sqlite" {
-        let types = column_types(pool, "accounts").await;
-        let needs_type = |col: &str, want: &str| {
-            types
-                .get(col)
-                .map(|t| !t.eq_ignore_ascii_case(want))
-                .unwrap_or(false)
-        };
-        if needs_type("usage_data", "jsonb") {
-            sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_data TYPE JSONB USING usage_data::JSONB")
-                .execute(pool)
-                .await
-                .ok();
-        }
-        if needs_type("usage_fetched_at", "timestamp with time zone") {
-            sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_fetched_at TYPE TIMESTAMPTZ USING usage_fetched_at::TIMESTAMPTZ")
-                .execute(pool)
-                .await
-                .ok();
-        }
-        if needs_type("oauth_expires_at", "timestamp with time zone") {
-            sqlx::query("ALTER TABLE accounts ALTER COLUMN oauth_expires_at TYPE TIMESTAMPTZ USING oauth_expires_at::TIMESTAMPTZ")
-                .execute(pool)
-                .await
-                .ok();
-        }
-        if needs_type("oauth_refreshed_at", "timestamp with time zone") {
-            sqlx::query("ALTER TABLE accounts ALTER COLUMN oauth_refreshed_at TYPE TIMESTAMPTZ USING oauth_refreshed_at::TIMESTAMPTZ")
-                .execute(pool)
-                .await
-                .ok();
-        }
+    let types = column_types(pool, "accounts").await;
+    let needs_type = |col: &str, want: &str| {
+        types
+            .get(col)
+            .map(|t| !t.eq_ignore_ascii_case(want))
+            .unwrap_or(false)
+    };
+    if needs_type("usage_data", "jsonb") {
+        sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_data TYPE JSONB USING usage_data::JSONB")
+            .execute(pool)
+            .await
+            .ok();
+    }
+    if needs_type("usage_fetched_at", "timestamp with time zone") {
+        sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_fetched_at TYPE TIMESTAMPTZ USING usage_fetched_at::TIMESTAMPTZ")
+            .execute(pool)
+            .await
+            .ok();
+    }
+    if needs_type("oauth_expires_at", "timestamp with time zone") {
+        sqlx::query("ALTER TABLE accounts ALTER COLUMN oauth_expires_at TYPE TIMESTAMPTZ USING oauth_expires_at::TIMESTAMPTZ")
+            .execute(pool)
+            .await
+            .ok();
+    }
+    if needs_type("oauth_refreshed_at", "timestamp with time zone") {
+        sqlx::query("ALTER TABLE accounts ALTER COLUMN oauth_refreshed_at TYPE TIMESTAMPTZ USING oauth_refreshed_at::TIMESTAMPTZ")
+            .execute(pool)
+            .await
+            .ok();
     }
 
     // Stamp the version last so a partial failure above causes a clean retry next boot.
@@ -228,19 +198,12 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-async fn existing_columns(pool: &AnyPool, driver: &str, table: &str) -> HashSet<String> {
-    let sql = if driver == "sqlite" {
-        format!(
-            "SELECT name FROM pragma_table_info('{}')",
-            table.replace('\'', "''")
-        )
-    } else {
-        format!(
-            "SELECT column_name FROM information_schema.columns \
-             WHERE table_schema = current_schema() AND table_name = '{}'",
-            table.replace('\'', "''")
-        )
-    };
+async fn existing_columns(pool: &AnyPool, table: &str) -> HashSet<String> {
+    let sql = format!(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = '{}'",
+        table.replace('\'', "''")
+    );
     sqlx::query_scalar::<_, String>(&sql)
         .fetch_all(pool)
         .await
@@ -263,46 +226,6 @@ async fn column_types(pool: &AnyPool, table: &str) -> std::collections::HashMap<
         Err(_) => std::collections::HashMap::new(),
     }
 }
-
-const SQLITE_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS accounts (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    name            TEXT NOT NULL DEFAULT '',
-    email           TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'active',
-    token           TEXT NOT NULL,
-    auth_type       TEXT NOT NULL DEFAULT 'setup_token',
-    access_token    TEXT NOT NULL DEFAULT '',
-    refresh_token   TEXT NOT NULL DEFAULT '',
-    oauth_expires_at    TEXT,
-    oauth_refreshed_at  TEXT,
-    auth_error      TEXT NOT NULL DEFAULT '',
-    proxy_url       TEXT NOT NULL DEFAULT '',
-    device_id       TEXT NOT NULL,
-    canonical_env   TEXT NOT NULL DEFAULT '{}',
-    canonical_prompt_env TEXT NOT NULL DEFAULT '{}',
-    canonical_process    TEXT NOT NULL DEFAULT '{}',
-    billing_mode    TEXT NOT NULL DEFAULT 'strip',
-    concurrency     INTEGER NOT NULL DEFAULT 3,
-    priority        INTEGER NOT NULL DEFAULT 50,
-    rate_limited_at      TEXT,
-    rate_limit_reset_at  TEXT,
-    account_uuid         TEXT,
-    organization_uuid    TEXT,
-    subscription_type    TEXT,
-    disable_reason       TEXT NOT NULL DEFAULT '',
-    auto_telemetry       INTEGER NOT NULL DEFAULT 0,
-    telemetry_count      INTEGER NOT NULL DEFAULT 0,
-    experimental_reveal_thinking INTEGER NOT NULL DEFAULT 0,
-    usage_data           TEXT NOT NULL DEFAULT '{}',
-    usage_fetched_at     TEXT,
-    platform        TEXT NOT NULL DEFAULT 'claude',
-    extra           TEXT NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-);
-
-"#;
 
 const PG_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS accounts (
@@ -342,19 +265,6 @@ CREATE TABLE IF NOT EXISTS accounts (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-"#;
-
-const SQLITE_TOKENS_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS api_tokens (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    name                TEXT NOT NULL DEFAULT '',
-    token               TEXT NOT NULL UNIQUE,
-    allowed_accounts    TEXT NOT NULL DEFAULT '',
-    blocked_accounts    TEXT NOT NULL DEFAULT '',
-    status              TEXT NOT NULL DEFAULT 'active',
-    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-)
 "#;
 
 const PG_TOKENS_SCHEMA: &str = r#"

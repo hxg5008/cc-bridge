@@ -6,38 +6,22 @@ use crate::model::api_token::ApiToken;
 
 pub struct TokenStore {
     pool: AnyPool,
-    driver: String,
 }
-
-const TOKEN_COLS: &str =
-    "id, name, token, allowed_accounts, blocked_accounts, status, created_at, updated_at";
 
 const TOKEN_COLS_PG_TEXT: &str =
     "id, name, token, allowed_accounts, blocked_accounts, status, created_at::text AS created_at, updated_at::text AS updated_at";
 
 impl TokenStore {
-    pub fn new(pool: AnyPool, driver: String) -> Self {
-        Self { pool, driver }
+    pub fn new(pool: AnyPool) -> Self {
+        Self { pool }
     }
 
     fn now_expr(&self) -> &str {
-        if self.driver == "sqlite" {
-            "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
-        } else {
-            "NOW()"
-        }
-    }
-
-    fn is_pg(&self) -> bool {
-        self.driver == "postgres"
+        "NOW()"
     }
 
     fn select_token_cols(&self) -> &'static str {
-        if self.is_pg() {
-            TOKEN_COLS_PG_TEXT
-        } else {
-            TOKEN_COLS
-        }
+        TOKEN_COLS_PG_TEXT
     }
 
     fn fmt_time(&self, t: DateTime<Utc>) -> String {

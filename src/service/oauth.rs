@@ -77,7 +77,9 @@ impl TokenTester {
             .header("anthropic-dangerous-direct-browser-access", "true")
             .header("User-Agent", format!("claude-cli/{} (external, cli)", version))
             .header("x-app", "cli")
-            .header("accept-encoding", "br, gzip, deflate")
+            // 不能要 br/gzip/deflate: 全局 reqwest 没启 gzip feature (gateway 透传需要保留压缩字节),
+            // 这里要了上游会回压缩字节, resp.text() 当 UTF-8 读 → 乱码。强制 identity 拿到明文。
+            .header("accept-encoding", "identity")
             .header("accept-language", "*")
             .header("sec-fetch-mode", "cors")
             .header("X-Stainless-Lang", "js")

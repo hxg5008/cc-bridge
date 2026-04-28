@@ -18,7 +18,7 @@
 set -euo pipefail
 
 # ---- 配置 (按需改这些常量) ----
-REPO="${CC_BRIDGE_REPO:-YOUR_GH_USER/cc-bridge}"
+REPO="${CC_BRIDGE_REPO:-hxg5008/cc-bridge}"
 INSTALL_DIR="${CC_BRIDGE_DIR:-/opt/cc-bridge}"
 SERVICE_USER="${CC_BRIDGE_USER:-ccbridge}"
 SERVICE_NAME="cc-bridge"
@@ -117,8 +117,11 @@ if [ ! -f "$INSTALL_DIR/.env" ]; then
 SERVER_HOST=127.0.0.1
 SERVER_PORT=$DEFAULT_PORT
 
-# 数据库: SQLite (50 用户场景够用; 多机请切 postgres)
-DATABASE_DRIVER=sqlite
+# 数据库: 仅支持 PostgreSQL (SQLite 已在 v1.8.x 下线 — 多并发写锁问题)
+# 部署前需自行准备 PostgreSQL: 本机 apt install postgresql 或外部托管,
+# 然后把下面 DATABASE_DSN 填上,再启动服务。
+DATABASE_DRIVER=postgres
+# DATABASE_DSN=postgres://cc-bridge:cc-bridge@127.0.0.1:5432/cc-bridge?sslmode=disable
 
 # 缓存: 留空走 in-memory (单机够用; 多机切 Redis)
 # REDIS_HOST=127.0.0.1

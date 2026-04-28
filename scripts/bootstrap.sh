@@ -4,10 +4,10 @@
 # 在干净的 Ubuntu/Debian 服务器上跑:
 #
 #   # 公开仓库 / 已 build 出 release:
-#   curl -fsSL https://raw.githubusercontent.com/YOUR_GH_USER/cc-bridge/ccb/scripts/bootstrap.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/hxg5008/cc-bridge/ccb/scripts/bootstrap.sh | sudo bash
 #
 #   # 私有仓库:
-#   curl -fsSL https://raw.githubusercontent.com/YOUR_GH_USER/cc-bridge/ccb/scripts/bootstrap.sh \
+#   curl -fsSL https://raw.githubusercontent.com/hxg5008/cc-bridge/ccb/scripts/bootstrap.sh \
 #     | sudo GH_TOKEN=ghp_xxx bash
 #
 #   # 指定版本:
@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-REPO="${CC_BRIDGE_REPO:-YOUR_GH_USER/cc-bridge}"
+REPO="${CC_BRIDGE_REPO:-hxg5008/cc-bridge}"
 TAG="${CC_BRIDGE_TAG:-latest}"
 WORKDIR="${CC_BRIDGE_WORKDIR:-/tmp/cc-bridge-deploy}"
 
