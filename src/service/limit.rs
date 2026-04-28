@@ -319,28 +319,138 @@ impl LimitStore {
 
     /// 从 `/api/oauth/usage` JSON（0-100 刻度）同步到内存，保持两条数据源一致。
     /// 仅用于 Admin 按钮路径。
+    ///
+    /// 副作用（治死锁）：当所有 utilization 窗口都低于 `HIT_THRESHOLD` 时，认为
+    /// 服务端最新观测值是健康的，顺手清除可能残留的本地软限流标记
+    /// （`rate_limited_until` 与 `status=Rejected`）。否则会出现死锁：
+    /// 旧请求把账号置 Rejected 后窗口已重置但本地热态没人来更新（because
+    /// `select_account` 不会发请求 → 没有 `absorb_headers` → 状态永远不刷新）。
+    /// 即使误清，下一次真请求 `absorb_headers` 会立刻把正确状态写回。
     pub fn ingest_usage_json(&self, account_id: i64, usage: &serde_json::Value) {
         let mut map = self.states.lock().unwrap();
         let mut state = map.get(&account_id).cloned().unwrap_or_default();
 
-        if let Some(w) = parse_usage_json_window(usage, "five_hour") {
+        // 先解析,留住"本次观测"的窗口结果用于死锁保护判断,然后再覆盖到 state。
+        let parsed_five = parse_usage_json_window(usage, "five_hour");
+        let parsed_seven = parse_usage_json_window(usage, "seven_day");
+        let parsed_sonnet = parse_usage_json_window(usage, "seven_day_sonnet");
+        let parsed_opus = parse_usage_json_window(usage, "seven_day_opus");
+
+        if let Some(w) = parsed_five.clone() {
             state.five_hour = Some(w);
         }
-        if let Some(w) = parse_usage_json_window(usage, "seven_day") {
+        if let Some(w) = parsed_seven.clone() {
             state.seven_day = Some(w);
         }
-        if let Some(w) = parse_usage_json_window(usage, "seven_day_sonnet") {
+        if let Some(w) = parsed_sonnet {
             state.sonnet_seven_day = Some(w);
         }
-        if let Some(w) = parse_usage_json_window(usage, "seven_day_opus") {
+        if let Some(w) = parsed_opus {
             state.opus_seven_day = Some(w);
         }
+
+        // 死锁保护：服务端最新数据所有窗口都健康 → 清除本地陈旧的 rate_limited_until
+        // 与 status=Rejected。这两个字段平时只由 `absorb_headers` 在收到上游响应时
+        // 更新；窗口已重置但 selector 仍把账号挡住时，本地永远没机会触发刷新。
+        // 注意：必须把"本次观测"传进 helper,不能让它读 state 上的旧窗口字段。
+        if auto_clear_stale_runtime_flags(
+            &mut state,
+            parsed_five.as_ref(),
+            parsed_seven.as_ref(),
+        ) {
+            let five = parsed_five.as_ref().map(|w| w.utilization).unwrap_or(0.0);
+            let seven = parsed_seven.as_ref().map(|w| w.utilization).unwrap_or(0.0);
+            info!(
+                "ingest_usage_json: account {} auto-cleared stale runtime flags (5h={:.1}%, 7d={:.1}%)",
+                account_id,
+                five * 100.0,
+                seven * 100.0
+            );
+        }
+
         state.updated_at = Some(Instant::now());
         map.insert(account_id, state);
+    }
+
+    /// 强制清除内存里的本地软限流标记（admin 手动 reset 路径）。
+    ///
+    /// 用途：极端情况下 `ingest_usage_json` 的自动清理仍未触发（例如 admin
+    /// 还没刷新过 usage），主人想立刻让账号恢复调度。**只清运行时旁路标记**，
+    /// 不动 5h/7d utilization 窗口数据 —— 那些是观测事实，不是诊断标记。
+    ///
+    /// 返回布尔表示是否真的清了什么（用于 admin 反馈）。
+    pub fn clear_runtime_flags(&self, account_id: i64) -> bool {
+        let mut map = self.states.lock().unwrap();
+        let state = match map.get_mut(&account_id) {
+            Some(s) => s,
+            None => return false,
+        };
+        let mut cleared = false;
+        if state.rate_limited_until.is_some() {
+            state.rate_limited_until = None;
+            cleared = true;
+        }
+        if state.status == Some(UnifiedStatus::Rejected) {
+            state.status = Some(UnifiedStatus::Allowed);
+            cleared = true;
+        }
+        if cleared {
+            state.updated_at = Some(Instant::now());
+        }
+        cleared
     }
 }
 
 // ---- 解析辅助 ----
+
+/// 当**本次** usage JSON 同时观测到 five_hour 和 seven_day 两个窗口、且二者
+/// utilization 都健康时，把 LimitState 上残留的本地软限流标记清零。
+/// 返回是否真的清了什么。抽成纯函数便于单测。
+///
+/// 保守策略（避免误清永久禁用账号）：
+/// - **必须本次解析观测到两个窗口** —— 不能复用 state 上的旧字段，否则可能拿过期
+///   数据当"健康证据"误清陈旧标记
+/// - 两个窗口都低于 [`HIT_THRESHOLD`]
+/// - `status=Rejected` 仅在没有 overage 标记时才降级；存在 `overage_status=Rejected`
+///   或 `overage_disabled_reason` 通常意味着 org-level 永久禁用，这种情况下 status
+///   不能被自动恢复（让管理员显式干预 / 等下次请求重新 absorb_headers 写正确状态）
+/// - `rate_limited_until` 始终可清（它是窗口性短期 ban，与 overage/org-level 无关；
+///   即便误清，下次真请求 absorb_headers 会立刻把正确值写回）
+fn auto_clear_stale_runtime_flags(
+    state: &mut LimitState,
+    observed_five_hour: Option<&WindowSnapshot>,
+    observed_seven_day: Option<&WindowSnapshot>,
+) -> bool {
+    // 只信本次观测,不信内存里的陈旧窗口数据 —— 否则旧 state 双窗口都有但本次只
+    // 更新 five_hour 时,会拿旧 seven_day 当"健康证据"误清陈旧 status/until。
+    let (five, seven) = match (observed_five_hour, observed_seven_day) {
+        (Some(f), Some(s)) => (f.utilization, s.utilization),
+        _ => return false,
+    };
+    if five >= HIT_THRESHOLD || seven >= HIT_THRESHOLD {
+        return false;
+    }
+
+    let mut cleared = false;
+
+    // rate_limited_until: 健康观测下始终可清
+    if state.rate_limited_until.is_some() {
+        state.rate_limited_until = None;
+        cleared = true;
+    }
+
+    // status=Rejected: overage 标记存在时不动 — 可能是 org-level 永久禁用
+    if state.status == Some(UnifiedStatus::Rejected) {
+        let has_overage_lock = state.overage_status == Some(OverageStatus::Rejected)
+            || state.overage_disabled_reason.is_some();
+        if !has_overage_lock {
+            state.status = Some(UnifiedStatus::Allowed);
+            cleared = true;
+        }
+    }
+
+    cleared
+}
 
 /// 根据响应头和 HTTP 状态码计算新的 LimitState（纯函数，便于单测）。
 ///
@@ -869,6 +979,15 @@ mod tests {
         h
     }
 
+    /// Test helper: 用 state 上现有的 five_hour/seven_day 作为"本次观测"调用
+    /// auto_clear_stale_runtime_flags。模拟 ingest_usage_json 在解析完新数据
+    /// 写入 state 后立刻调用 helper 的真实路径。
+    fn run_auto_clear_with_state_as_observed(state: &mut LimitState) -> bool {
+        let five = state.five_hour.clone();
+        let seven = state.seven_day.clone();
+        auto_clear_stale_runtime_flags(state, five.as_ref(), seven.as_ref())
+    }
+
     fn real_200_headers() -> HeaderMap {
         // 来自真实抓包的 200 响应头子集（见 Phase 2 plan）
         make_headers(&[
@@ -1268,6 +1387,231 @@ mod tests {
             ..Default::default()
         };
         assert!(judge_availability(&state).is_available());
+    }
+
+    // ---- 死锁修复（auto_clear_stale_runtime_flags）----
+    //
+    // 死锁背景：absorb_headers 在响应里把 rate_limited_until 或 status=Rejected
+    // 写入内存；refresh_usage 走另一条路 (ingest_usage_json) 只更新 utilization
+    // 窗口；窗口已重置但旧标记没人清 → judge_availability 持续 Unavailable →
+    // selector 不发请求 → 没有 absorb_headers 来更新 → 永远挡。
+    // auto_clear_stale_runtime_flags 在 utilization 健康时主动解套。
+
+    /// utilization 都健康时，rate_limited_until 残留应被清除。
+    #[test]
+    fn auto_clear_stale_clears_rate_limited_until_when_healthy() {
+        let mut state = LimitState {
+            rate_limited_until: Some(Utc::now() + chrono::Duration::hours(1)),
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.10,
+                resets_at: Utc::now() + chrono::Duration::hours(4),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            seven_day: Some(WindowSnapshot {
+                utilization: 0.30,
+                resets_at: Utc::now() + chrono::Duration::days(3),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        let cleared = run_auto_clear_with_state_as_observed(&mut state);
+        assert!(cleared, "应清除残留的 rate_limited_until");
+        assert!(state.rate_limited_until.is_none());
+    }
+
+    /// utilization 都健康时，status=Rejected 残留应翻成 Allowed。
+    #[test]
+    fn auto_clear_stale_clears_status_rejected_when_healthy() {
+        let mut state = LimitState {
+            status: Some(UnifiedStatus::Rejected),
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.10,
+                resets_at: Utc::now() + chrono::Duration::hours(4),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            seven_day: Some(WindowSnapshot {
+                utilization: 0.20,
+                resets_at: Utc::now() + chrono::Duration::days(3),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        let cleared = run_auto_clear_with_state_as_observed(&mut state);
+        assert!(cleared);
+        assert_eq!(state.status, Some(UnifiedStatus::Allowed));
+    }
+
+    /// 任一 utilization 窗口达到 HIT_THRESHOLD 时，绝对不能清——服务端真的撞墙了。
+    #[test]
+    fn auto_clear_stale_does_not_clear_when_utilization_high() {
+        let mut state = LimitState {
+            rate_limited_until: Some(Utc::now() + chrono::Duration::hours(1)),
+            status: Some(UnifiedStatus::Rejected),
+            five_hour: Some(WindowSnapshot {
+                utilization: HIT_THRESHOLD + 0.001, // 略高于阈值
+                resets_at: Utc::now() + chrono::Duration::hours(4),
+                status: UnifiedStatus::Rejected,
+                surpassed_threshold: Some(0.97),
+            }),
+            // 双窗口都填:确保测试聚焦 five_hour 高,而不是被"缺 seven_day"短路
+            seven_day: Some(WindowSnapshot {
+                utilization: 0.30,
+                resets_at: Utc::now() + chrono::Duration::days(3),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        let cleared = run_auto_clear_with_state_as_observed(&mut state);
+        assert!(!cleared, "high five_hour utilization 时不能清陈旧标记");
+        assert!(state.rate_limited_until.is_some());
+        assert_eq!(state.status, Some(UnifiedStatus::Rejected));
+    }
+
+    /// 健康但本来也没残留：返回 false（不报告"清了"）。
+    #[test]
+    fn auto_clear_stale_returns_false_when_nothing_to_clear() {
+        let mut state = LimitState {
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.10,
+                resets_at: Utc::now() + chrono::Duration::hours(4),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        assert!(!run_auto_clear_with_state_as_observed(&mut state));
+    }
+
+    /// P0 修复 #2：缺失任一窗口（5h 或 7d）时不能清——信息不全宁可保守。
+    /// 防止 API 返回 partial usage 时被误判为"全 0% 健康"。
+    #[test]
+    fn auto_clear_stale_does_nothing_when_a_window_is_missing() {
+        // 仅 five_hour, 没有 seven_day
+        let mut state = LimitState {
+            rate_limited_until: Some(Utc::now() + chrono::Duration::hours(1)),
+            status: Some(UnifiedStatus::Rejected),
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.10,
+                resets_at: Utc::now() + chrono::Duration::hours(4),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            seven_day: None,
+            ..Default::default()
+        };
+        assert!(
+            !run_auto_clear_with_state_as_observed(&mut state),
+            "缺 seven_day 时不应触发清理"
+        );
+        assert!(state.rate_limited_until.is_some(), "rate_limited_until 应保留");
+        assert_eq!(state.status, Some(UnifiedStatus::Rejected), "status 应保留");
+    }
+
+    /// P0 修复 #3：当 overage_status=Rejected 或 overage_disabled_reason 存在时，
+    /// 不能自动 demote status=Rejected → Allowed —— 这通常是 org-level 永久禁用，
+    /// 误清后下次请求会撞 403/permission_error。
+    /// 但 rate_limited_until 仍然可清（它是窗口性短期 ban，与 org-level 无关）。
+    #[test]
+    fn auto_clear_stale_keeps_status_when_overage_locked() {
+        let mut state = LimitState {
+            rate_limited_until: Some(Utc::now() + chrono::Duration::hours(1)),
+            status: Some(UnifiedStatus::Rejected),
+            overage_status: Some(OverageStatus::Rejected),
+            overage_disabled_reason: Some("org_level_disabled".into()),
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.10,
+                resets_at: Utc::now() + chrono::Duration::hours(4),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            seven_day: Some(WindowSnapshot {
+                utilization: 0.30,
+                resets_at: Utc::now() + chrono::Duration::days(3),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        let cleared = run_auto_clear_with_state_as_observed(&mut state);
+        assert!(cleared, "rate_limited_until 仍应被清(它跟 overage 无关)");
+        assert!(state.rate_limited_until.is_none());
+        assert_eq!(
+            state.status,
+            Some(UnifiedStatus::Rejected),
+            "overage 锁定时不应把 Rejected 降级为 Allowed"
+        );
+    }
+
+    /// P0#2 关键回归：旧 state 已经有 healthy 双窗口数据,但**本次** usage JSON
+    /// 只解析出 five_hour 一个窗口。helper 必须只信本次观测,不信旧 state 字段,
+    /// 否则会拿过期数据当"健康证据"误清陈旧 status/until。
+    ///
+    /// 这是 codex 复审指出的真实漏点（见 round-2 review）。
+    #[test]
+    fn auto_clear_stale_does_not_use_stale_window_from_state() {
+        // 旧 state: 双窗口都健康 + status=Rejected + rate_limited_until 残留
+        let mut state = LimitState {
+            rate_limited_until: Some(Utc::now() + chrono::Duration::hours(1)),
+            status: Some(UnifiedStatus::Rejected),
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.10,
+                resets_at: Utc::now() + chrono::Duration::hours(4),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            seven_day: Some(WindowSnapshot {
+                utilization: 0.20,
+                resets_at: Utc::now() + chrono::Duration::days(3),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+
+        // 本次观测：只有 five_hour（API 返回 partial）, seven_day = None
+        let observed_five = WindowSnapshot {
+            utilization: 0.15,
+            resets_at: Utc::now() + chrono::Duration::hours(4),
+            status: UnifiedStatus::Allowed,
+            surpassed_threshold: None,
+        };
+        let cleared = auto_clear_stale_runtime_flags(&mut state, Some(&observed_five), None);
+        assert!(
+            !cleared,
+            "本次观测缺 seven_day 时不应清,即使 state 上有旧 seven_day"
+        );
+        assert!(state.rate_limited_until.is_some());
+        assert_eq!(state.status, Some(UnifiedStatus::Rejected));
+    }
+
+    /// seven_day 高 utilization 时也不清(覆盖原测试只测 five_hour)。
+    #[test]
+    fn auto_clear_stale_does_not_clear_when_seven_day_high() {
+        let mut state = LimitState {
+            rate_limited_until: Some(Utc::now() + chrono::Duration::hours(1)),
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.10,
+                resets_at: Utc::now() + chrono::Duration::hours(4),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            seven_day: Some(WindowSnapshot {
+                utilization: HIT_THRESHOLD + 0.001,
+                resets_at: Utc::now() + chrono::Duration::days(3),
+                status: UnifiedStatus::Rejected,
+                surpassed_threshold: Some(0.97),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !run_auto_clear_with_state_as_observed(&mut state),
+            "seven_day 高 utilization 应阻止清理"
+        );
     }
 
     /// 首次进入短期隔离应触发 flush（first-fill 覆盖更广，但短期隔离场景值得单测）。

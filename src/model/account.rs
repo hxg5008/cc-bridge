@@ -181,6 +181,10 @@ pub struct Account {
     /// 累计发送的遥测请求次数。
     #[serde(default)]
     pub telemetry_count: i64,
+    /// 实验性：开启后剥离 redact-thinking-2026-02-12 beta token，让 thinking 正文回流。
+    /// Anthropic 可能反 fingerprint，建议仅在测试账号开启。每个账号独立控制。
+    #[serde(default)]
+    pub experimental_reveal_thinking: bool,
     #[serde(default)]
     pub usage_data: Value,
     #[serde(skip_serializing_if = "Option::is_none")]

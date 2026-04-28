@@ -359,6 +359,15 @@ impl AccountService {
     /// - DB 中 `usage_fetched_at` < 60s 的成功结果直接复用（覆盖 UI 反复点击 / poller 两个调用源）；
     /// - 上游回 429 后，账号进入 60s 本地冷却，期间所有调用直接返回 `TooManyRequests`，
     ///   避免持续打上游被滚雪球。
+    /// 强制清除内存里的本地软限流标记（rate_limited_until / status=Rejected）。
+    ///
+    /// 使用场景：admin 发现账号 admin UI 显示用量已重置但 selector 仍持续过滤
+    /// 该账号时（典型死锁：absorb_headers 写入的 status/until 没机会被新请求刷新），
+    /// 通过 admin 按钮手动调用此方法。返回布尔表示是否真的清了什么。
+    pub fn clear_limit_runtime_flags(&self, id: i64) -> bool {
+        self.limit_store.clear_runtime_flags(id)
+    }
+
     pub async fn refresh_usage(&self, id: i64) -> Result<serde_json::Value, AppError> {
         let account = self.store.get_by_id(id).await?;
         if account.auth_type != crate::model::account::AccountAuthType::Oauth {
@@ -378,6 +387,10 @@ impl AccountService {
                     id,
                     age.num_seconds()
                 );
+                // 即使走 cache hit,也把缓存数据再 ingest 一次内存——确保自动死锁保护
+                // (auto_clear_stale_runtime_flags) 有机会运行。否则用户在死锁状态下
+                // 60s 内连点"刷新用量"按钮全部走 cache 直返,内存陈旧标记永远清不掉。
+                self.limit_store.ingest_usage_json(id, &account.usage_data);
                 return Ok(account.usage_data.clone());
             }
         }

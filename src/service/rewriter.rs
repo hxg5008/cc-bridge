@@ -144,18 +144,25 @@ fn build_axios_headers(profile: HttpProfile, version: &str) -> HashMap<String, S
 const DEFAULT_VERSION: &str = crate::config::CLAUDE_CODE_VERSION;
 
 /// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
-fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
+/// `denylist` 中的 token 永远不会出现在结果里，无论它来自 required 还是 incoming。
+fn merge_anthropic_beta(required: &str, incoming: &str, denylist: &[&str]) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut tokens = Vec::new();
     for t in required.split(',') {
         let t = t.trim();
-        if !t.is_empty() && seen.insert(t.to_string()) {
+        if t.is_empty() || denylist.iter().any(|d| *d == t) {
+            continue;
+        }
+        if seen.insert(t.to_string()) {
             tokens.push(t.to_string());
         }
     }
     for t in incoming.split(',') {
         let t = t.trim();
-        if !t.is_empty() && seen.insert(t.to_string()) {
+        if t.is_empty() || denylist.iter().any(|d| *d == t) {
+            continue;
+        }
+        if seen.insert(t.to_string()) {
             tokens.push(t.to_string());
         }
     }
@@ -184,7 +191,9 @@ fn strip_1m_suffix(model_id: &str) -> (&str, bool) {
 
 /// - `CONTEXT_MANAGEMENT`  : Claude 4+ 模型（opus-4/sonnet-4/haiku-4）
 /// - `PROMPT_CACHING_SCOPE`: 始终（firstParty）
-pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
+///
+/// `reveal_thinking=true` 时跳过 `redact-thinking-2026-02-12`（实验性账号开关）。
+pub fn compute_betas_for_model(model_id: &str, reveal_thinking: bool) -> Vec<&'static str> {
     let (base, needs_1m) = strip_1m_suffix(model_id);
     let lower = base.to_lowercase();
     let is_haiku = lower.contains("haiku");
@@ -201,7 +210,9 @@ pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
     out.push("oauth-2025-04-20");
     if supports_isp {
         out.push("interleaved-thinking-2025-05-14");
-        out.push("redact-thinking-2026-02-12");
+        if !reveal_thinking {
+            out.push("redact-thinking-2026-02-12");
+        }
     }
     if is_claude4_plus {
         out.push("context-management-2025-06-27");
@@ -218,8 +229,8 @@ pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
     out
 }
 
-fn beta_header_for_model(model_id: &str) -> String {
-    compute_betas_for_model(model_id).join(",")
+fn beta_header_for_model(model_id: &str, reveal_thinking: bool) -> String {
+    compute_betas_for_model(model_id, reveal_thinking).join(",")
 }
 
 /// 处理所有请求的反检测改写。
@@ -268,7 +279,7 @@ impl Rewriter {
             );
             out.insert(
                 "anthropic-beta".into(),
-                beta_header_for_model(model_id).into(),
+                beta_header_for_model(model_id, account.experimental_reveal_thinking).into(),
             );
             out.insert("anthropic-version".into(), "2023-06-01".into());
             out.insert(
@@ -389,10 +400,21 @@ impl Rewriter {
                 .or_insert_with(generate_session_uuid);
 
             // 合并客户端 beta 与必需 beta
+            // reveal_thinking 开启时,denylist 强制剥离 redact-thinking-2026-02-12,
+            // 即使客户端 incoming 自己带了这个 token 也不会被合并出去。
             let existing_beta = out.get("anthropic-beta").cloned().unwrap_or_default();
+            let denylist: &[&str] = if account.experimental_reveal_thinking {
+                &["redact-thinking-2026-02-12"]
+            } else {
+                &[]
+            };
             out.insert(
                 "anthropic-beta".into(),
-                merge_anthropic_beta(&beta_header_for_model(model_id), &existing_beta),
+                merge_anthropic_beta(
+                    &beta_header_for_model(model_id, account.experimental_reveal_thinking),
+                    &existing_beta,
+                    denylist,
+                ),
             );
         }
 
@@ -1402,7 +1424,7 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod beta_tests {
-    use super::{compute_betas_for_model, strip_1m_suffix};
+    use super::{compute_betas_for_model, merge_anthropic_beta, strip_1m_suffix};
 
     fn contains(set: &[&str], s: &str) -> bool {
         set.iter().any(|x| *x == s)
@@ -1410,7 +1432,7 @@ mod beta_tests {
 
     #[test]
     fn sonnet_4_5_gets_full_first_party_set() {
-        let b = compute_betas_for_model("claude-sonnet-4-5-20250929");
+        let b = compute_betas_for_model("claude-sonnet-4-5-20250929", false);
         assert!(contains(&b, "claude-code-20250219"));
         assert!(contains(&b, "oauth-2025-04-20"));
         assert!(contains(&b, "interleaved-thinking-2025-05-14"));
@@ -1421,7 +1443,7 @@ mod beta_tests {
 
     #[test]
     fn opus_4_6_gets_full_first_party_set() {
-        let b = compute_betas_for_model("claude-opus-4-6");
+        let b = compute_betas_for_model("claude-opus-4-6", false);
         assert!(contains(&b, "claude-code-20250219"));
         assert!(contains(&b, "context-management-2025-06-27"));
         assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
@@ -1429,7 +1451,7 @@ mod beta_tests {
 
     #[test]
     fn haiku_4_5_excludes_claude_code_but_keeps_isp_and_context_mgmt() {
-        let b = compute_betas_for_model("claude-haiku-4-5");
+        let b = compute_betas_for_model("claude-haiku-4-5", false);
         // Haiku 分支不发 claude-code-20250219
         assert!(!contains(&b, "claude-code-20250219"));
         // 但仍支持 ISP / context management / prompt-caching-scope
@@ -1442,7 +1464,7 @@ mod beta_tests {
 
     #[test]
     fn haiku_3_5_strips_isp_and_context_mgmt() {
-        let b = compute_betas_for_model("claude-3-5-haiku-20241022");
+        let b = compute_betas_for_model("claude-3-5-haiku-20241022", false);
         assert!(!contains(&b, "claude-code-20250219"));
         // claude-3-* 不支持 ISP（源码 betas.ts:107）
         assert!(!contains(&b, "interleaved-thinking-2025-05-14"));
@@ -1456,7 +1478,7 @@ mod beta_tests {
 
     #[test]
     fn claude_3_opus_behaves_as_legacy() {
-        let b = compute_betas_for_model("claude-3-opus-20240229");
+        let b = compute_betas_for_model("claude-3-opus-20240229", false);
         assert!(contains(&b, "claude-code-20250219")); // 非 haiku
         assert!(!contains(&b, "interleaved-thinking-2025-05-14"));
         assert!(!contains(&b, "context-management-2025-06-27"));
@@ -1465,14 +1487,14 @@ mod beta_tests {
 
     #[test]
     fn ordering_is_stable_across_calls() {
-        let a = compute_betas_for_model("claude-sonnet-4-5");
-        let b = compute_betas_for_model("claude-sonnet-4-5");
+        let a = compute_betas_for_model("claude-sonnet-4-5", false);
+        let b = compute_betas_for_model("claude-sonnet-4-5", false);
         assert_eq!(a, b);
     }
 
     #[test]
     fn model_id_with_1m_suffix_adds_context_1m_beta() {
-        let b = compute_betas_for_model("claude-sonnet-4-6[1m]");
+        let b = compute_betas_for_model("claude-sonnet-4-6[1m]", false);
         assert!(contains(&b, "context-1m-2025-08-07"));
         // 基础 beta 按剥离后的 base model id（claude-sonnet-4-6）计算
         assert!(contains(&b, "context-management-2025-06-27"));
@@ -1481,7 +1503,7 @@ mod beta_tests {
 
     #[test]
     fn model_id_without_1m_suffix_omits_context_1m_beta() {
-        let b = compute_betas_for_model("claude-sonnet-4-5-20250929");
+        let b = compute_betas_for_model("claude-sonnet-4-5-20250929", false);
         assert!(!contains(&b, "context-1m-2025-08-07"));
     }
 
@@ -1491,5 +1513,69 @@ mod beta_tests {
         assert_eq!(strip_1m_suffix("claude-opus-4-7[1m]"), ("claude-opus-4-7", true));
         assert_eq!(strip_1m_suffix("claude-sonnet-4-5-20250929"), ("claude-sonnet-4-5-20250929", false));
         assert_eq!(strip_1m_suffix("[1m]"), ("", true));
+    }
+
+    // ─── reveal_thinking 开关行为 ───
+
+    #[test]
+    fn reveal_thinking_on_strips_redact_token_for_isp_models() {
+        let b = compute_betas_for_model("claude-sonnet-4-5-20250929", true);
+        // ISP 仍在,只剥 redact
+        assert!(contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(!contains(&b, "redact-thinking-2026-02-12"));
+    }
+
+    #[test]
+    fn reveal_thinking_on_for_haiku_4_also_strips_redact() {
+        let b = compute_betas_for_model("claude-haiku-4-5", true);
+        assert!(contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(!contains(&b, "redact-thinking-2026-02-12"));
+    }
+
+    #[test]
+    fn reveal_thinking_no_effect_on_claude_3() {
+        // claude-3-* 本来就 !supports_isp,reveal_thinking 取值无关
+        let on = compute_betas_for_model("claude-3-opus-20240229", true);
+        let off = compute_betas_for_model("claude-3-opus-20240229", false);
+        assert!(!contains(&on, "redact-thinking-2026-02-12"));
+        assert!(!contains(&off, "redact-thinking-2026-02-12"));
+        assert_eq!(on, off);
+    }
+
+    // ─── merge_anthropic_beta + denylist ───
+
+    #[test]
+    fn merge_dedups_required_and_incoming() {
+        let out = merge_anthropic_beta("a,b,c", "b,c,d", &[]);
+        assert_eq!(out, "a,b,c,d");
+    }
+
+    #[test]
+    fn merge_denylist_filters_from_required() {
+        let out = merge_anthropic_beta("a,redact-thinking-2026-02-12,c", "x", &["redact-thinking-2026-02-12"]);
+        assert!(!out.contains("redact-thinking-2026-02-12"));
+        assert!(out.contains("a"));
+        assert!(out.contains("c"));
+        assert!(out.contains("x"));
+    }
+
+    #[test]
+    fn merge_denylist_filters_from_incoming() {
+        // 关键回归:即使 required 没传 redact,incoming 自带 redact 也要被剥
+        let out = merge_anthropic_beta(
+            "interleaved-thinking-2025-05-14,oauth-2025-04-20",
+            "claude-code-20250219,redact-thinking-2026-02-12,extra",
+            &["redact-thinking-2026-02-12"],
+        );
+        assert!(!out.contains("redact-thinking-2026-02-12"));
+        assert!(out.contains("interleaved-thinking-2025-05-14"));
+        assert!(out.contains("claude-code-20250219"));
+        assert!(out.contains("extra"));
+    }
+
+    #[test]
+    fn merge_empty_denylist_is_no_op() {
+        let out = merge_anthropic_beta("a,b", "redact-thinking-2026-02-12", &[]);
+        assert!(out.contains("redact-thinking-2026-02-12"));
     }
 }

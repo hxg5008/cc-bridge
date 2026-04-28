@@ -84,6 +84,7 @@ pub fn build_router(
         )
         .route("/admin/accounts/:id/test", post(test_account))
         .route("/admin/accounts/:id/usage", post(refresh_usage))
+        .route("/admin/accounts/:id/clear_limit", post(clear_limit_state))
         .route("/admin/tokens", get(list_tokens).post(create_token))
         .route(
             "/admin/tokens/:id",
@@ -616,6 +617,7 @@ struct CreateAccountRequest {
     concurrency: Option<i32>,
     priority: Option<i32>,
     auto_telemetry: Option<bool>,
+    experimental_reveal_thinking: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -662,6 +664,7 @@ async fn create_account(
         disable_reason: String::new(),
         auto_telemetry: req.auto_telemetry.unwrap_or(false),
         telemetry_count: 0,
+        experimental_reveal_thinking: req.experimental_reveal_thinking.unwrap_or(false),
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         platform: "claude".into(),
@@ -776,6 +779,12 @@ async fn update_account(
     }
     if let Some(auto_telemetry) = updates.get("auto_telemetry").and_then(|v| v.as_bool()) {
         existing.auto_telemetry = auto_telemetry;
+    }
+    if let Some(reveal) = updates
+        .get("experimental_reveal_thinking")
+        .and_then(|v| v.as_bool())
+    {
+        existing.experimental_reveal_thinking = reveal;
     }
 
     // OpenAI 平台专用字段 partial merge 到 extra (chatgpt_account_id / organization_id / base_url 等)
@@ -959,6 +968,23 @@ async fn refresh_usage(
             ))
         }
     }
+}
+
+/// 手动清除指定账号的内存软限流标记（rate_limited_until / status=Rejected）。
+///
+/// 触发场景：admin UI 显示账号 5h/7d 用量已重置但调度器仍持续过滤该账号——
+/// 这通常是 `absorb_headers` 写入的旧标记没有机会被新请求刷新（因为本地挡了所以
+/// 没请求发出去 → 死锁）。`refresh_usage` 自动清理已经覆盖大部分场景，此 endpoint
+/// 作为最后的人工逃生口。
+async fn clear_limit_state(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cleared = state.account_svc.clear_limit_runtime_flags(id);
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "cleared": cleared,
+    })))
 }
 
 // --- Token Handlers ---
@@ -1208,6 +1234,7 @@ async fn build_account_from_cookie_auth(
         disable_reason: String::new(),
         auto_telemetry: req.auto_telemetry.unwrap_or(false),
         telemetry_count: 0,
+        experimental_reveal_thinking: false,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         platform: "claude".into(),
@@ -1472,6 +1499,7 @@ async fn create_openai_account(
         disable_reason: String::new(),
         auto_telemetry: false,
         telemetry_count: 0,
+        experimental_reveal_thinking: false,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         platform: "openai".into(),
@@ -1781,6 +1809,7 @@ async fn build_openai_account_from_rt(
         disable_reason: String::new(),
         auto_telemetry: false,
         telemetry_count: 0,
+        experimental_reveal_thinking: false,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         platform: "openai".into(),

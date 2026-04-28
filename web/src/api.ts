@@ -56,6 +56,7 @@ export interface Account {
   auto_telemetry: boolean
   telemetry_count: number
   telemetry_expires_at?: string
+  experimental_reveal_thinking?: boolean
   rate_limited_at?: string
   rate_limit_reset_at?: string
   disable_reason?: string

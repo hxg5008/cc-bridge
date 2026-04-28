@@ -97,7 +97,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     let json_type = if driver == "sqlite" { "TEXT" } else { "JSONB" };
     let cols = existing_columns(pool, driver, "accounts").await;
 
-    let pending: [(&str, String); 17] = [
+    let pending: [(&str, String); 18] = [
         (
             "billing_mode",
             "ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'".into(),
@@ -167,6 +167,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         (
             "extra",
             format!("ALTER TABLE accounts ADD COLUMN extra {} NOT NULL DEFAULT '{{}}'", json_type),
+        ),
+        // 上游 v1.8.6: experimental_reveal_thinking per-account toggle
+        (
+            "experimental_reveal_thinking",
+            "ALTER TABLE accounts ADD COLUMN experimental_reveal_thinking INTEGER NOT NULL DEFAULT 0".into(),
         ),
     ];
     for (name, sql) in pending.iter() {
@@ -288,6 +293,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     disable_reason       TEXT NOT NULL DEFAULT '',
     auto_telemetry       INTEGER NOT NULL DEFAULT 0,
     telemetry_count      INTEGER NOT NULL DEFAULT 0,
+    experimental_reveal_thinking INTEGER NOT NULL DEFAULT 0,
     usage_data           TEXT NOT NULL DEFAULT '{}',
     usage_fetched_at     TEXT,
     platform        TEXT NOT NULL DEFAULT 'claude',
@@ -327,6 +333,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     disable_reason       TEXT NOT NULL DEFAULT '',
     auto_telemetry       INT NOT NULL DEFAULT 0,
     telemetry_count      BIGINT NOT NULL DEFAULT 0,
+    experimental_reveal_thinking INT NOT NULL DEFAULT 0,
     usage_data           JSONB NOT NULL DEFAULT '{}',
     usage_fetched_at     TIMESTAMPTZ,
     platform        TEXT NOT NULL DEFAULT 'claude',

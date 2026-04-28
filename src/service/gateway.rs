@@ -497,8 +497,14 @@ fn wrap_429_response(resp: Response) -> Response {
     let status = resp.status();
     let mut builder = Response::builder().status(status);
     for (k, v) in resp.headers() {
-        // content-length / content-type 会被新 body 覆盖；跳过避免冲突
-        if matches!(k.as_str(), "content-length" | "content-type") {
+        // content-length / content-type 会被新 body 覆盖；跳过避免冲突。
+        // content-encoding 必须跳过 — 上游可能带 gzip/br，但 wrap 后 body 是明文 JSON,
+        // 保留原 encoding 头会让客户端按 gzip 解明文导致整个响应坏掉。
+        // transfer-encoding 同理 — 上游 chunked 与新 body 的 framing 不同步,必须重算。
+        if matches!(
+            k.as_str(),
+            "content-length" | "content-type" | "content-encoding" | "transfer-encoding"
+        ) {
             continue;
         }
         builder = builder.header(k.clone(), v.clone());
@@ -531,7 +537,13 @@ fn wrap_5xx_response(resp: Response) -> Response {
     let mut builder = Response::builder().status(status);
     for (k, v) in resp.headers() {
         let name_lower = k.as_str().to_ascii_lowercase();
-        if matches!(name_lower.as_str(), "content-length" | "content-type") {
+        // content-encoding 必须跳过 — 同 wrap_429,wrap 后 body 是明文 JSON,
+        // 保留原 encoding 头会让客户端按 gzip 解明文。
+        // transfer-encoding 同理 — 上游 chunked framing 与新 body 不同步。
+        if matches!(
+            name_lower.as_str(),
+            "content-length" | "content-type" | "content-encoding" | "transfer-encoding"
+        ) {
             continue;
         }
         if matches!(
@@ -1197,6 +1209,65 @@ mod tests {
         assert_eq!(
             wrapped.headers().get("content-type").and_then(|v| v.to_str().ok()),
             Some("application/json")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_429_response_strips_content_encoding() {
+        // 上游 429 带 gzip + chunked;wrap 后 body 是明文 JSON,必须剥 content-encoding
+        // 和 transfer-encoding,否则客户端会把明文当成 gzip 解 / 错误 framing,响应直接坏掉。
+        let original = make_429(
+            &[
+                ("content-encoding", "gzip"),
+                ("transfer-encoding", "chunked"),
+                ("retry-after", "60"),
+            ],
+            b"\x1f\x8b...fake gzip bytes",
+        );
+        let wrapped = wrap_429_response(original);
+        assert!(
+            wrapped.headers().get("content-encoding").is_none(),
+            "wrap_429_response 必须剥离 content-encoding 头"
+        );
+        assert!(
+            wrapped.headers().get("transfer-encoding").is_none(),
+            "wrap_429_response 必须剥离 transfer-encoding 头"
+        );
+        // 同时确保非编码头(如 retry-after)仍然保留
+        assert_eq!(
+            wrapped.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("60")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_5xx_response_strips_content_encoding() {
+        // 同 wrap_429:上游 5xx 带 br/gzip + chunked 时,wrap 替换为明文 JSON 后必须剥 encoding 头。
+        let original = make_5xx(
+            StatusCode::BAD_GATEWAY,
+            &[
+                ("content-encoding", "br"),
+                ("transfer-encoding", "chunked"),
+                ("anthropic-ratelimit-unified-five-hour-status", "allowed"),
+            ],
+            b"...fake brotli bytes",
+        );
+        let wrapped = wrap_5xx_response(original);
+        assert!(
+            wrapped.headers().get("content-encoding").is_none(),
+            "wrap_5xx_response 必须剥离 content-encoding 头"
+        );
+        assert!(
+            wrapped.headers().get("transfer-encoding").is_none(),
+            "wrap_5xx_response 必须剥离 transfer-encoding 头"
+        );
+        // 限流相关业务头仍然要保留
+        assert!(
+            wrapped
+                .headers()
+                .get("anthropic-ratelimit-unified-five-hour-status")
+                .is_some(),
+            "anthropic-ratelimit-* 业务头不该被误剥"
         );
     }
 }

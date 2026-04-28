@@ -59,6 +59,7 @@ const form = ref({
   concurrency: 5,
   priority: 50,
   auto_telemetry: false,
+  experimental_reveal_thinking: false,
   // OpenAI 专用 (走 account.extra,仅在编辑 platform=openai 账号时显示)
   chatgpt_account_id: '',
   organization_id: '',
@@ -139,6 +140,7 @@ function openCreate() {
     concurrency: 5,
     priority: 50,
     auto_telemetry: false,
+    experimental_reveal_thinking: false,
     chatgpt_account_id: '',
     organization_id: '',
     base_url: '',
@@ -169,6 +171,7 @@ function openEdit(a: Account) {
     concurrency: a.concurrency,
     priority: a.priority,
     auto_telemetry: a.auto_telemetry ?? false,
+    experimental_reveal_thinking: a.experimental_reveal_thinking ?? false,
     chatgpt_account_id: typeof extra.chatgpt_account_id === 'string' ? extra.chatgpt_account_id : '',
     organization_id: typeof extra.organization_id === 'string' ? extra.organization_id : '',
     base_url: typeof extra.base_url === 'string' ? extra.base_url : '',
@@ -212,12 +215,13 @@ async function save() {
           base_url: form.value.base_url.trim(),
         };
       } else {
-        // Claude 账号: billing_mode / 订阅 / Account/Org UUID / 自动遥测
+        // Claude 账号: billing_mode / 订阅 / Account/Org UUID / 自动遥测 / 思考显示
         updates.billing_mode = form.value.billing_mode;
         updates.account_uuid = form.value.account_uuid || null;
         updates.organization_uuid = form.value.organization_uuid || null;
         updates.subscription_type = form.value.subscription_type || null;
         updates.auto_telemetry = form.value.auto_telemetry;
+        updates.experimental_reveal_thinking = form.value.experimental_reveal_thinking;
       }
       await api.updateAccount(editing.value.id, updates);
     } else {
@@ -242,6 +246,7 @@ async function save() {
         concurrency: form.value.concurrency,
         priority: form.value.priority,
         auto_telemetry: form.value.auto_telemetry,
+        experimental_reveal_thinking: form.value.experimental_reveal_thinking,
       };
       if (normalizedExpiresAt) payload.expires_at = normalizedExpiresAt;
       await api.createAccount(payload);
@@ -853,6 +858,7 @@ function applyOAuthResult() {
     concurrency: 5,
     priority: 50,
     auto_telemetry: false,
+    experimental_reveal_thinking: false,
     chatgpt_account_id: '',
     organization_id: '',
     base_url: '',
@@ -1537,6 +1543,35 @@ async function copyText(text: string) {
               </button>
             </div>
             <p class="text-xs text-[#b5b0a6]">开启后由网关代替客户端发送遥测请求</p>
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">
+              显示思考内容
+              <span class="ml-2 inline-block px-1.5 py-0.5 text-[10px] rounded border border-amber-400 bg-amber-50 text-amber-700 align-middle">实验性</span>
+            </Label>
+            <div class="flex gap-2">
+              <button
+                type="button"
+                @click="form.experimental_reveal_thinking = false"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="!form.experimental_reveal_thinking
+                  ? 'bg-[#f9f6f1] border-[#8c8475] text-[#5c5647]'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-[#8c8475]/40'"
+              >
+                关闭
+              </button>
+              <button
+                type="button"
+                @click="form.experimental_reveal_thinking = true"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="form.experimental_reveal_thinking
+                  ? 'bg-amber-50 border-amber-400 text-amber-700'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+              >
+                开启
+              </button>
+            </div>
+            <p class="text-xs text-[#b5b0a6]">剥离 redact-thinking beta token，让模型思考正文回流到 Claude Code 终端。Anthropic 可能反指纹检测，建议仅在测试号开启，每个账号独立控制。</p>
           </div>
           </template>
           <div class="flex gap-4">

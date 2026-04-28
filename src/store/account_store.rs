@@ -209,6 +209,10 @@ impl AccountStore {
                 .unwrap_or_default(),
             auto_telemetry: row.try_get::<i32, _>("auto_telemetry").unwrap_or(0) != 0,
             telemetry_count: row.try_get::<i64, _>("telemetry_count").unwrap_or(0),
+            experimental_reveal_thinking: row
+                .try_get::<i32, _>("experimental_reveal_thinking")
+                .unwrap_or(0)
+                != 0,
             usage_data: Self::parse_json(row, "usage_data"),
             usage_fetched_at: Self::parse_optional_time(row, "usage_fetched_at"),
             platform: row
@@ -243,13 +247,14 @@ impl AccountStore {
 
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
         let extra_str = serde_json::to_string(&a.extra).unwrap_or_else(|_| "{}".into());
+        let experimental_reveal_thinking_int: i32 = if a.experimental_reveal_thinking { 1 } else { 0 };
         let q = format!(
             r#"INSERT INTO accounts (name, email, status, token, proxy_url,
                 auth_type, access_token, refresh_token, oauth_expires_at, oauth_refreshed_at, auth_error,
                 device_id, canonical_env, canonical_prompt_env, canonical_process,
                 billing_mode, account_uuid, organization_uuid, subscription_type,
-                concurrency, priority, auto_telemetry, platform, extra)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,{},{},{},$20,$21,$22,$23,{})
+                concurrency, priority, auto_telemetry, platform, extra, experimental_reveal_thinking)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,{},{},{},$20,$21,$22,$23,{},$25)
             RETURNING {}"#,
             self.nullable_ts(9),
             self.nullable_ts(10),
@@ -288,6 +293,7 @@ impl AccountStore {
             .bind(auto_telemetry_int)
             .bind(&a.platform)
             .bind(&extra_str)
+            .bind(experimental_reveal_thinking_int)
             .fetch_one(&self.pool)
             .await?;
 
@@ -303,20 +309,21 @@ impl AccountStore {
         let oauth_refreshed_at = a.oauth_refreshed_at.map(|t| self.fmt_time(t));
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
         let extra_str = serde_json::to_string(&a.extra).unwrap_or_else(|_| "{}".into());
+        let experimental_reveal_thinking_int: i32 = if a.experimental_reveal_thinking { 1 } else { 0 };
         let q = format!(
             r#"UPDATE accounts SET name=$1, email=$2, status=$3, token=$4,
                 auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at={}, oauth_refreshed_at={},
                 auth_error=$10, proxy_url=$11, billing_mode=$12,
                 account_uuid={}, organization_uuid={}, subscription_type={},
                 concurrency=$16, priority=$17, auto_telemetry=$18,
-                platform=$20, extra={}, updated_at={}
-            WHERE id=$19"#,
+                experimental_reveal_thinking=$19, platform=$21, extra={}, updated_at={}
+            WHERE id=$20"#,
             self.nullable_ts(8),
             self.nullable_ts(9),
             self.nullable(13),
             self.nullable(14),
             self.nullable(15),
-            self.jsonb(21),
+            self.jsonb(22),
             self.now_expr()
         );
         sqlx::query(&q)
@@ -338,6 +345,7 @@ impl AccountStore {
             .bind(a.concurrency)
             .bind(a.priority)
             .bind(auto_telemetry_int)
+            .bind(experimental_reveal_thinking_int)
             .bind(a.id)
             .bind(&a.platform)
             .bind(&extra_str)
@@ -592,7 +600,7 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     canonical_env, canonical_prompt_env, canonical_process,
     billing_mode, account_uuid, organization_uuid, subscription_type,
     concurrency, priority, rate_limited_at, rate_limit_reset_at,
-    disable_reason, auto_telemetry, telemetry_count,
+    disable_reason, auto_telemetry, telemetry_count, experimental_reveal_thinking,
     usage_data, usage_fetched_at, platform, extra, created_at, updated_at"#;
 
 const ACCOUNT_COLS_PG_TEXT: &str = r#"id, name, email, status, token, auth_type, access_token, refresh_token,
@@ -603,7 +611,7 @@ const ACCOUNT_COLS_PG_TEXT: &str = r#"id, name, email, status, token, auth_type,
     billing_mode, account_uuid, organization_uuid, subscription_type,
     concurrency, priority, rate_limited_at::text AS rate_limited_at,
     rate_limit_reset_at::text AS rate_limit_reset_at,
-    disable_reason, auto_telemetry, telemetry_count,
+    disable_reason, auto_telemetry, telemetry_count, experimental_reveal_thinking,
     usage_data::text AS usage_data, usage_fetched_at::text AS usage_fetched_at,
     platform, extra::text AS extra,
     created_at::text AS created_at, updated_at::text AS updated_at"#;

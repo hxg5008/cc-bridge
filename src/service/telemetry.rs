@@ -626,7 +626,11 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
     }
 
     // betas: 使用 rewriter 对同一模型计算出的真实 beta 列表
-    let betas = crate::service::rewriter::compute_betas_for_model(ctx.model).join(",");
+    let betas = crate::service::rewriter::compute_betas_for_model(
+        ctx.model,
+        ctx.account.experimental_reveal_thinking,
+    )
+    .join(",");
     let build_age_mins = compute_build_age_minutes(&env.build_time);
 
     // tengu_api_success 的典型载荷 — 合理随机
@@ -893,6 +897,7 @@ mod tests {
             disable_reason: String::new(),
             auto_telemetry: true,
             telemetry_count: 0,
+            experimental_reveal_thinking: false,
             usage_data: json!({}),
             usage_fetched_at: None,
             platform: "claude".into(),
@@ -975,7 +980,7 @@ mod tests {
         let account = make_account();
         let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
         let betas = event_data(&batch)["betas"].as_str().unwrap().to_string();
-        let expected = crate::service::rewriter::compute_betas_for_model("claude-sonnet-4-5")
+        let expected = crate::service::rewriter::compute_betas_for_model("claude-sonnet-4-5", false)
             .join(",");
         assert_eq!(betas, expected);
         assert!(
