@@ -120,10 +120,18 @@ impl GatewayService {
 
     /// 核心网关逻辑 -- axum handler。
     pub async fn handle_request(&self, req: Request, api_token: Option<&ApiToken>) -> Response {
-        match self.handle_request_inner(req, api_token).await {
+        crate::service::metrics::METRICS
+            .record_gateway_request(crate::service::metrics::Platform::Claude);
+        let resp = match self.handle_request_inner(req, api_token).await {
             Ok(resp) => resp,
             Err(e) => e.into_response(),
+        };
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            crate::service::metrics::METRICS
+                .record_gateway_error(crate::service::metrics::Platform::Claude, status);
         }
+        resp
     }
 
     #[allow(unused_assignments)]

@@ -18,6 +18,7 @@ use crate::service::account::AccountService;
 use crate::service::gateway::GatewayService;
 use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
+use crate::service::openai_oauth::OpenAIOAuthService;
 use crate::service::telemetry::TelemetryService;
 use crate::store::token_store::TokenStore;
 
@@ -28,6 +29,7 @@ pub struct AppState {
     pub token_tester: Arc<TokenTester>,
     pub token_store: Arc<TokenStore>,
     pub oauth_flow_svc: Arc<OAuthFlowService>,
+    pub openai_oauth_svc: Arc<OpenAIOAuthService>,
     pub telemetry_svc: Arc<TelemetryService>,
     pub admin_password: String,
 }
@@ -39,6 +41,7 @@ pub fn build_router(
     token_tester: Arc<TokenTester>,
     token_store: Arc<TokenStore>,
     oauth_flow_svc: Arc<OAuthFlowService>,
+    openai_oauth_svc: Arc<OpenAIOAuthService>,
     telemetry_svc: Arc<TelemetryService>,
 ) -> Router {
     let state = AppState {
@@ -47,6 +50,7 @@ pub fn build_router(
         token_tester,
         token_store,
         oauth_flow_svc,
+        openai_oauth_svc,
         telemetry_svc,
         admin_password: cfg.admin.password.clone(),
     };
@@ -63,6 +67,13 @@ pub fn build_router(
     let asset_routes = Router::new()
         .route("/assets/*rest", get(asset_handler))
         .route("/favicon.svg", get(asset_handler));
+
+    // 健康检查端点 (公开, 无需鉴权; 容器编排 / 反代探活用)
+    let health_routes = Router::new()
+        .route("/livez", get(livez_handler))
+        .route("/readyz", get(readyz_handler))
+        .route("/metrics", get(metrics_handler))
+        .with_state(state.clone());
 
     // 管理 API（密码认证，完整路径注册）
     let admin_routes = Router::new()
@@ -92,6 +103,40 @@ pub fn build_router(
             "/admin/oauth/exchange-setup-token-code",
             post(oauth_exchange_setup_token_code),
         )
+        .route("/admin/accounts/cookie-auth", post(oauth_cookie_auth))
+        .route(
+            "/admin/accounts/cookie-auth-create",
+            post(oauth_cookie_auth_create),
+        )
+        .route(
+            "/admin/accounts/cookie-auth-create/batch",
+            post(oauth_cookie_auth_create_batch),
+        )
+        .route("/admin/accounts/openai", post(create_openai_account))
+        .route(
+            "/admin/accounts/openai-rt-import",
+            post(openai_rt_import),
+        )
+        .route(
+            "/admin/accounts/openai-rt-import/batch",
+            post(openai_rt_import_batch),
+        )
+        .route(
+            "/admin/accounts/:id/openai-usage/probe",
+            post(openai_usage_probe),
+        )
+        .route(
+            "/admin/openai-oauth/generate-auth-url",
+            post(openai_oauth_generate_auth_url),
+        )
+        .route(
+            "/admin/openai-oauth/exchange-code",
+            post(openai_oauth_exchange_code),
+        )
+        .route(
+            "/admin/openai-oauth/refresh-token",
+            post(openai_oauth_refresh_token),
+        )
         .layer(middleware::from_fn(move |req, next: Next| {
             let pwd = admin_password.clone();
             admin_auth(pwd, req, next)
@@ -102,6 +147,7 @@ pub fn build_router(
     Router::new()
         .merge(frontend_routes)
         .merge(asset_routes)
+        .merge(health_routes)
         .merge(admin_routes)
         .fallback(gateway_fallback)
         .with_state(state)
@@ -120,10 +166,390 @@ async fn gateway_fallback(State(state): State<AppState>, req: Request) -> Respon
         Ok(None) => return err_json(StatusCode::UNAUTHORIZED, "invalid api key"),
         Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "authentication failed"),
     };
+
+    // OpenAI 协议路径分发: /v1/chat/completions 与 /v1/responses 走 OpenAI 账号池
+    let path = req.uri().path();
+    if path == "/v1/chat/completions" {
+        return openai_proxy_request(&state, req, "/v1/chat/completions", &api_token)
+            .await
+            .unwrap_or_else(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
+    }
+    if path == "/v1/responses" || path.starts_with("/v1/responses/") {
+        return openai_proxy_request(&state, req, "/v1/responses", &api_token)
+            .await
+            .unwrap_or_else(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
+    }
+
     state
         .gateway_svc
         .handle_request(req, Some(&api_token))
         .await
+}
+
+/// OpenAI /v1/* 透传 helper (供 /v1/chat/completions 和 /v1/responses 共用)
+async fn openai_proxy_request(
+    state: &AppState,
+    req: Request,
+    upstream_path: &str,
+    api_token: &ApiToken,
+) -> Result<Response, AppError> {
+    crate::service::metrics::METRICS
+        .record_gateway_request(crate::service::metrics::Platform::OpenAI);
+    openai_chat_completions_inner(state, req, upstream_path, api_token).await
+}
+
+/// 构造并发送一次上游请求 (供 retry loop 复用)。
+///
+/// 输入:
+///   - `account`: 已选好且(若 OAuth)已刷新过的账号
+///   - `client_headers`: 客户端原始请求头, 用于白名单透传
+///   - `body_bytes`: 客户端原始 body
+///   - `body_json_orig`: 已解析 body (Null 表示非 JSON)
+///   - `client_pck`: 客户端 prompt_cache_key (优先)
+///   - `raw_seed`: derive_session_seed 的结果, 用于 session_id 派生
+///   - `api_token`: 鉴权后的 token, id 用于 session 隔离
+///   - `upstream_path`: `/v1/chat/completions` 或 `/v1/responses`
+async fn build_and_send_openai(
+    account: &Account,
+    client_headers: &axum::http::HeaderMap,
+    body_bytes: &axum::body::Bytes,
+    body_json_orig: &serde_json::Value,
+    client_pck: Option<&str>,
+    raw_seed: &str,
+    api_token: &ApiToken,
+    upstream_path: &str,
+) -> Result<reqwest::Response, AppError> {
+    // 选 token
+    let token = if !account.access_token.is_empty() {
+        account.access_token.clone()
+    } else {
+        account.setup_token.clone()
+    };
+    if token.is_empty() {
+        return Err(AppError::ServiceUnavailable(
+            "selected account has no token".into(),
+        ));
+    }
+
+    let is_oauth = account.auth_type == AccountAuthType::Oauth;
+    let extra = account.extra.as_object();
+    let organization_id = extra
+        .and_then(|m| m.get("organization_id"))
+        .and_then(|v| v.as_str());
+    let chatgpt_account_id = extra
+        .and_then(|m| m.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str());
+
+    // Codex body transform (仅 OAuth)
+    let final_body: Vec<u8> = if is_oauth && body_json_orig.is_object() {
+        let mut body_json = body_json_orig.clone();
+        let _result = crate::service::codex_transform::apply_codex_oauth_transform(
+            &mut body_json,
+            true,
+        );
+
+        if client_pck.is_none() {
+            let model = body_json
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !raw_seed.is_empty()
+                && crate::service::codex_session::should_auto_inject_prompt_cache_key(&model)
+            {
+                if let Some(map) = body_json.as_object_mut() {
+                    map.insert(
+                        "prompt_cache_key".into(),
+                        serde_json::Value::String(raw_seed.to_string()),
+                    );
+                }
+            }
+        }
+
+        serde_json::to_vec(&body_json).unwrap_or_else(|_| body_bytes.to_vec())
+    } else {
+        body_bytes.to_vec()
+    };
+
+    // URL 决策
+    let (upstream_url, host_override, ua_default) = if is_oauth {
+        (
+            "https://chatgpt.com/backend-api/codex/responses".to_string(),
+            Some("chatgpt.com"),
+            "codex_cli_rs/0.104.0",
+        )
+    } else {
+        let base = extra
+            .and_then(|m| m.get("base_url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("https://api.openai.com");
+        (
+            format!("{}{}", base.trim_end_matches('/'), upstream_path),
+            None,
+            "OpenAI/Python 1.40.0",
+        )
+    };
+
+    // 构造上游请求
+    let client = crate::tlsfp::make_request_client(&account.proxy_url);
+    let mut up_req = client
+        .post(&upstream_url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream")
+        .body(final_body);
+
+    let user_agent_extra = extra
+        .and_then(|m| m.get("user_agent"))
+        .and_then(|v| v.as_str());
+    let ua: &str = if is_oauth {
+        "codex_cli_rs/0.104.0"
+    } else {
+        user_agent_extra.unwrap_or(ua_default)
+    };
+    up_req = up_req.header("User-Agent", ua);
+
+    if is_oauth {
+        if let Some(host) = host_override {
+            up_req = up_req.header("Host", host);
+        }
+        up_req = up_req
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("Originator", "codex_cli_rs")
+            .header("Version", "0.104.0");
+
+        if let Some(cid) = chatgpt_account_id {
+            up_req = up_req.header("chatgpt-account-id", cid);
+        }
+
+        if !raw_seed.is_empty() {
+            let isolated =
+                crate::service::codex_session::isolate_session_id(api_token.id, raw_seed);
+            let session_uuid =
+                crate::service::codex_session::generate_session_uuid(&isolated);
+            up_req = up_req
+                .header("session_id", session_uuid.clone())
+                .header("conversation_id", session_uuid);
+        }
+    } else if let Some(oid) = organization_id {
+        up_req = up_req.header("OpenAI-Organization", oid);
+    }
+
+    // 透传客户端白名单头
+    for (name, value) in client_headers.iter() {
+        let n = name.as_str().to_lowercase();
+        if !matches!(
+            n.as_str(),
+            "openai-beta" | "openai-organization" | "x-request-id" | "x-stainless-lang"
+        ) {
+            continue;
+        }
+        if is_oauth && (n == "openai-beta" || n == "openai-organization") {
+            continue;
+        }
+        up_req = up_req.header(name.as_str(), value.as_bytes());
+    }
+
+    up_req
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("upstream request: {}", e)))
+}
+
+/// OpenAI 转发核心逻辑。
+///
+/// 路由策略:
+///   - OAuth 账号 (Plus/Pro/Team OAuth token) → chatgpt.com/backend-api/codex/responses
+///     带 Codex CLI 专用 header: chatgpt-account-id, Originator, OpenAI-Beta, Version
+///     并对 body 做完整 codex transform (store=false / system 提取 / 不支持参数清理 / 等)
+///   - API Key / Codex Token / Setup Token → api.openai.com (extra.base_url 可覆盖)
+///
+/// 防风控关键点 (sub2api 同款):
+///   - User-Agent 强制 codex_cli_rs/0.104.0, Originator 强制 codex_cli_rs (硬编码不可关)
+///   - instructions 为空时填充嵌入的官方 Codex CLI 模板
+///   - session_id / conversation_id 用 prompt_cache_key (或 body 内容种子) 派生 UUID,
+///     api_token id 做隔离, 防跨 token prompt cache 串扰
+///   - 粘性会话: 同一 prompt_cache_key 粘到同一 OpenAI 账号 (24h TTL)
+async fn openai_chat_completions_inner(
+    state: &AppState,
+    req: Request,
+    upstream_path: &str,
+    api_token: &ApiToken,
+) -> Result<Response, AppError> {
+    use axum::body::{to_bytes, Body};
+    use axum::http::HeaderValue;
+
+    // ---- 1) 读 client body ----
+    let (parts, body) = req.into_parts();
+    let body_bytes = to_bytes(body, 50 * 1024 * 1024)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("read body: {}", e)))?;
+
+    // 试解析为 JSON, 失败就保持 raw 透传 (兼容非 JSON 客户端)
+    let body_json_orig: serde_json::Value =
+        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+
+    // ---- 2) 派生稳定 session seed (用于粘性 + session_id 头) ----
+    let client_pck = body_json_orig
+        .get("prompt_cache_key")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let raw_seed = crate::service::codex_session::derive_session_seed(
+        &body_json_orig,
+        client_pck.as_deref(),
+    );
+    let session_hash = crate::service::codex_session::sticky_session_cache_key(&raw_seed);
+
+    let allowed_ids = api_token.allowed_account_ids();
+    let mut exclude_ids = api_token.blocked_account_ids();
+
+    // ---- 3-11) 选号 + 刷 + 构造 + 发送, 5xx 时切账号重试一次 ----
+    const MAX_ATTEMPTS: u32 = 2;
+    let mut attempt: u32 = 0;
+    let (account, resp, status, headers) = loop {
+        attempt += 1;
+
+        // 选 OpenAI 账号 (粘性 + 黑白名单 + 5xx exclude)
+        let mut account = state
+            .account_svc
+            .select_openai_account(&session_hash, &exclude_ids, &allowed_ids)
+            .await?;
+
+        // OAuth access_token 自动刷新 (带全局锁防 thundering herd)
+        if account.auth_type == AccountAuthType::Oauth {
+            match state
+                .account_svc
+                .resolve_openai_access_token(&account, &state.openai_oauth_svc)
+                .await
+            {
+                Ok(refreshed) => {
+                    account = refreshed;
+                    crate::service::metrics::METRICS
+                        .record_oauth_refresh(crate::service::metrics::Platform::OpenAI, true);
+                }
+                Err(e) => {
+                    crate::service::metrics::METRICS
+                        .record_oauth_refresh(crate::service::metrics::Platform::OpenAI, false);
+                    tracing::warn!(
+                        "openai resolve_access_token failed for account {}: {}",
+                        account.id,
+                        e
+                    );
+                }
+            }
+        }
+
+        let resp = build_and_send_openai(
+            &account,
+            &parts.headers,
+            &body_bytes,
+            &body_json_orig,
+            client_pck.as_deref(),
+            &raw_seed,
+            api_token,
+            upstream_path,
+        )
+        .await?;
+
+        let status = resp.status();
+        let headers_clone = resp.headers().clone();
+
+        if status.as_u16() >= 400 {
+            crate::service::metrics::METRICS.record_gateway_error(
+                crate::service::metrics::Platform::OpenAI,
+                status.as_u16(),
+            );
+        }
+
+        // 5xx 失败转移: 标短期冷却 + 把当前账号加 exclude, 再选一次
+        let is_5xx = (500..600).contains(&status.as_u16());
+        if is_5xx && attempt < MAX_ATTEMPTS {
+            tracing::warn!(
+                "openai upstream 5xx ({}) on account {}, failing over",
+                status.as_u16(),
+                account.id
+            );
+            crate::service::metrics::METRICS.record_failover();
+
+            // 不写 codex_429_until (那是 429 专属); 用 60s cooldown 短期回避
+            let svc = state.account_svc.clone();
+            let acc_id = account.id;
+            tokio::spawn(async move {
+                let until = crate::service::openai_limit::compute_429_cooldown_until(None);
+                let _ = persist_codex_429_until(svc, acc_id, until).await;
+            });
+
+            exclude_ids.push(account.id);
+            // resp / body 不读, 直接 drop
+            drop(resp);
+            continue;
+        }
+
+        break (account, resp, status, headers_clone);
+    };
+
+    let is_oauth = account.auth_type == AccountAuthType::Oauth;
+
+    // ---- 12) 异步落用量到 account.extra ----
+    if is_oauth {
+        if let Some(usage_update) = parse_codex_rate_limit_headers(&headers) {
+            let svc = state.account_svc.clone();
+            let acc_id = account.id;
+            tokio::spawn(async move {
+                let _ = persist_codex_usage(svc, acc_id, usage_update).await;
+            });
+        }
+
+        // 429 → 写 codex_429_until 触发账号短期冷却 (默认 60s, Retry-After 优先)
+        if status.as_u16() == 429 {
+            let retry_after = headers
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let svc = state.account_svc.clone();
+            let acc_id = account.id;
+            tokio::spawn(async move {
+                let until = crate::service::openai_limit::compute_429_cooldown_until(
+                    retry_after.as_deref(),
+                );
+                if let Err(e) = persist_codex_429_until(svc, acc_id, until).await {
+                    tracing::warn!(
+                        "persist codex_429_until failed for account {}: {}",
+                        acc_id,
+                        e
+                    );
+                } else {
+                    tracing::warn!(
+                        "openai account {} 429 → cooldown until {}",
+                        acc_id,
+                        until
+                    );
+                }
+            });
+        }
+    }
+
+    // ---- 13) 流式响应透传 ----
+    let mut builder = Response::builder().status(
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+    );
+    for (name, value) in headers.iter() {
+        let lname = name.as_str().to_lowercase();
+        if matches!(
+            lname.as_str(),
+            "transfer-encoding" | "connection" | "content-length"
+        ) {
+            continue;
+        }
+        builder = builder.header(
+            name.as_str(),
+            HeaderValue::from_bytes(value.as_bytes()).unwrap_or(HeaderValue::from_static("")),
+        );
+    }
+    let response = builder
+        .body(Body::from_stream(resp.bytes_stream()))
+        .unwrap_or_else(|_| err_json(StatusCode::INTERNAL_SERVER_ERROR, "build response failed"));
+    Ok(response)
 }
 
 /// 统一 JSON 错误响应
@@ -238,6 +664,8 @@ async fn create_account(
         telemetry_count: 0,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
+        platform: "claude".into(),
+        extra: serde_json::json!({}),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -350,6 +778,24 @@ async fn update_account(
         existing.auto_telemetry = auto_telemetry;
     }
 
+    // OpenAI 平台专用字段 partial merge 到 extra (chatgpt_account_id / organization_id / base_url 等)
+    if let Some(extra_patch) = updates.get("extra").and_then(|v| v.as_object()) {
+        let mut current = match existing.extra.as_object() {
+            Some(o) => o.clone(),
+            None => serde_json::Map::new(),
+        };
+        for (k, v) in extra_patch.iter() {
+            // null 或空字符串 → 删除该字段;否则覆盖
+            let is_empty_string = matches!(v, serde_json::Value::String(s) if s.is_empty());
+            if v.is_null() || is_empty_string {
+                current.remove(k);
+            } else {
+                current.insert(k.clone(), v.clone());
+            }
+        }
+        existing.extra = serde_json::Value::Object(current);
+    }
+
     state.account_svc.update_account(&existing).await?;
     Ok(Json(existing))
 }
@@ -367,6 +813,113 @@ async fn test_account(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let account = state.account_svc.get_account(id).await?;
+    // OpenAI 账号: 用 OAuth refresh_token 调一次 auth.openai.com 验证
+    if account.platform == "openai" {
+        if account.auth_type == AccountAuthType::Oauth && !account.refresh_token.is_empty() {
+            return Ok(Json(
+                match state
+                    .openai_oauth_svc
+                    .refresh_token(&account.refresh_token, &account.proxy_url)
+                    .await
+                {
+                    Ok(refreshed) => {
+                        // 持久化: 把新 token + expires_at 写回, 顺便清掉 auth_error
+                        let mut updated = account.clone();
+                        updated.access_token = refreshed.access_token.clone();
+                        if !refreshed.refresh_token.is_empty() {
+                            updated.refresh_token = refreshed.refresh_token.clone();
+                        }
+                        updated.expires_at =
+                            Utc.timestamp_opt(refreshed.expires_at, 0).single();
+                        updated.auth_error = String::new();
+                        // 把 chatgpt_account_id / organization_id 也补到 extra (refresh 时可能拿到新的)
+                        if !refreshed.chatgpt_account_id.is_empty()
+                            || !refreshed.organization_id.is_empty()
+                            || !refreshed.plan_type.is_empty()
+                            || !refreshed.email.is_empty()
+                            || !refreshed.subscription_expires_at.is_empty()
+                            || !refreshed.privacy_mode.is_empty()
+                        {
+                            let mut extra = match updated.extra.as_object() {
+                                Some(o) => o.clone(),
+                                None => serde_json::Map::new(),
+                            };
+                            if !refreshed.chatgpt_account_id.is_empty() {
+                                extra.insert(
+                                    "chatgpt_account_id".into(),
+                                    serde_json::json!(refreshed.chatgpt_account_id),
+                                );
+                            }
+                            if !refreshed.organization_id.is_empty() {
+                                extra.insert(
+                                    "organization_id".into(),
+                                    serde_json::json!(refreshed.organization_id),
+                                );
+                            }
+                            if !refreshed.plan_type.is_empty() {
+                                extra.insert(
+                                    "plan_type".into(),
+                                    serde_json::json!(refreshed.plan_type),
+                                );
+                            }
+                            if !refreshed.subscription_expires_at.is_empty() {
+                                extra.insert(
+                                    "subscription_expires_at".into(),
+                                    serde_json::json!(refreshed.subscription_expires_at),
+                                );
+                            }
+                            if !refreshed.privacy_mode.is_empty() {
+                                extra.insert(
+                                    "privacy_mode".into(),
+                                    serde_json::json!(refreshed.privacy_mode),
+                                );
+                            }
+                            updated.extra = serde_json::Value::Object(extra);
+                        }
+                        let _ = state.account_svc.update_account(&updated).await;
+                        serde_json::json!({"status": "ok"})
+                    }
+                    Err(e) => serde_json::json!({"status": "error", "message": e.to_string()}),
+                },
+            ));
+        }
+        // API Key / Codex Token 模式: 简单调一次 /v1/models 验证 token 活性
+        let token = if !account.access_token.is_empty() {
+            account.access_token.clone()
+        } else {
+            account.setup_token.clone()
+        };
+        if token.is_empty() {
+            return Ok(Json(
+                serde_json::json!({"status": "error", "message": "no token to test"}),
+            ));
+        }
+        let base = account
+            .extra
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("https://api.openai.com");
+        let url = format!("{}/v1/models", base.trim_end_matches('/'));
+        let client = crate::tlsfp::make_request_client(&account.proxy_url);
+        return Ok(Json(
+            match client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => serde_json::json!({"status": "ok"}),
+                Ok(r) => {
+                    let s = r.status();
+                    let t = r.text().await.unwrap_or_default();
+                    serde_json::json!({"status": "error", "message": format!("{} {}", s, t)})
+                }
+                Err(e) => serde_json::json!({"status": "error", "message": e.to_string()}),
+            },
+        ));
+    }
+
+    // Claude 账号: 走原 TokenTester
     let token = match state.account_svc.resolve_upstream_token(id).await {
         Ok(token) => token,
         Err(e) => {
@@ -496,12 +1049,19 @@ async fn get_dashboard(State(state): State<AppState>) -> Result<Json<serde_json:
     let mut active = 0;
     let mut err_count = 0;
     let mut disabled = 0;
+    let mut by_platform: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for a in &accounts {
         match a.status {
             AccountStatus::Active => active += 1,
             AccountStatus::Error => err_count += 1,
             AccountStatus::Disabled => disabled += 1,
         }
+        let key = if a.platform.is_empty() {
+            "claude".to_string()
+        } else {
+            a.platform.clone()
+        };
+        *by_platform.entry(key).or_insert(0) += 1;
     }
 
     Ok(Json(serde_json::json!({
@@ -510,6 +1070,7 @@ async fn get_dashboard(State(state): State<AppState>) -> Result<Json<serde_json:
             "active": active,
             "error": err_count,
             "disabled": disabled,
+            "by_platform": by_platform,
         },
         "tokens": token_count,
     })))
@@ -545,6 +1106,909 @@ async fn oauth_exchange_setup_token_code(
 ) -> Result<Json<crate::service::oauth_flow::ExchangeCodeResponse>, AppError> {
     let resp = state.oauth_flow_svc.exchange_setup_token_code(&req).await?;
     Ok(Json(resp))
+}
+
+// --- SessionKey-based 自动 OAuth Handlers ---
+
+/// POST /admin/accounts/cookie-auth (sub2api 兼容: 只换 token 不建账号)
+async fn oauth_cookie_auth(
+    State(state): State<AppState>,
+    Json(req): Json<crate::service::oauth_flow::CookieAuthRequest>,
+) -> Result<Json<crate::service::oauth_flow::CookieAuthResponse>, AppError> {
+    let resp = state.oauth_flow_svc.cookie_auth(&req).await?;
+    Ok(Json(resp))
+}
+
+#[derive(Deserialize, Clone)]
+struct CookieAuthCreateRequest {
+    session_key: String,
+    #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    // 账号字段 (全部可选)
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    concurrency: Option<i32>,
+    #[serde(default)]
+    billing_mode: Option<String>,
+    #[serde(default)]
+    auto_telemetry: Option<bool>,
+    #[serde(default)]
+    subscription_type: Option<String>,
+}
+
+async fn build_account_from_cookie_auth(
+    state: &AppState,
+    req: &CookieAuthCreateRequest,
+) -> Result<Account, AppError> {
+    let token = state
+        .oauth_flow_svc
+        .cookie_auth(&crate::service::oauth_flow::CookieAuthRequest {
+            session_key: req.session_key.clone(),
+            proxy_url: req.proxy_url.clone(),
+            scope: req.scope.clone(),
+        })
+        .await?;
+
+    let email = token.email_address.clone();
+    if email.is_empty() {
+        return Err(AppError::Internal(
+            "OAuth 成功但未拿到 email_address, 无法创建账号".into(),
+        ));
+    }
+    let name = req.name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| email.clone());
+
+    let expires_at = if token.expires_at > 0 {
+        Utc.timestamp_opt(token.expires_at, 0).single()
+    } else {
+        None
+    };
+
+    let mut account = Account {
+        id: 0,
+        name,
+        email,
+        status: AccountStatus::Active,
+        auth_type: AccountAuthType::Oauth,
+        setup_token: String::new(),
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        expires_at,
+        oauth_refreshed_at: None,
+        auth_error: String::new(),
+        proxy_url: req.proxy_url.clone().unwrap_or_default(),
+        device_id: String::new(),
+        canonical_env: serde_json::json!({}),
+        canonical_prompt: serde_json::json!({}),
+        canonical_process: serde_json::json!({}),
+        billing_mode: req
+            .billing_mode
+            .clone()
+            .unwrap_or_else(|| "strip".into())
+            .into(),
+        account_uuid: if token.account_uuid.is_empty() {
+            None
+        } else {
+            Some(token.account_uuid)
+        },
+        organization_uuid: if token.organization_uuid.is_empty() {
+            None
+        } else {
+            Some(token.organization_uuid)
+        },
+        subscription_type: req.subscription_type.clone(),
+        concurrency: req.concurrency.unwrap_or(3),
+        priority: req.priority.unwrap_or(50),
+        rate_limited_at: None,
+        rate_limit_reset_at: None,
+        disable_reason: String::new(),
+        auto_telemetry: req.auto_telemetry.unwrap_or(false),
+        telemetry_count: 0,
+        usage_data: serde_json::json!({}),
+        usage_fetched_at: None,
+        platform: "claude".into(),
+        extra: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    state.account_svc.create_account(&mut account).await?;
+    Ok(account)
+}
+
+/// POST /admin/accounts/cookie-auth-create (cc-bridge 自定义: 一步换 token + 建账号)
+async fn oauth_cookie_auth_create(
+    State(state): State<AppState>,
+    Json(req): Json<CookieAuthCreateRequest>,
+) -> Result<(StatusCode, Json<Account>), AppError> {
+    let account = build_account_from_cookie_auth(&state, &req).await?;
+    Ok((StatusCode::CREATED, Json(account)))
+}
+
+#[derive(Deserialize)]
+struct CookieAuthCreateBatchRequest {
+    session_keys: Vec<String>,
+    #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    concurrency_limit: Option<usize>,
+    // 共享的账号默认值
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    concurrency: Option<i32>,
+    #[serde(default)]
+    billing_mode: Option<String>,
+    #[serde(default)]
+    auto_telemetry: Option<bool>,
+    #[serde(default)]
+    subscription_type: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct BatchItemResult {
+    session_key_preview: String,
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct CookieAuthCreateBatchResponse {
+    total: usize,
+    success: usize,
+    failed: usize,
+    results: Vec<BatchItemResult>,
+}
+
+fn mask_session_key(sk: &str) -> String {
+    let n = sk.chars().count();
+    if n <= 18 {
+        return "***".to_string();
+    }
+    let head: String = sk.chars().take(12).collect();
+    let tail: String = sk.chars().skip(n - 6).collect();
+    format!("{}...{}", head, tail)
+}
+
+/// POST /admin/accounts/cookie-auth-create/batch
+async fn oauth_cookie_auth_create_batch(
+    State(state): State<AppState>,
+    Json(req): Json<CookieAuthCreateBatchRequest>,
+) -> Result<Json<CookieAuthCreateBatchResponse>, AppError> {
+    if req.session_keys.is_empty() {
+        return Err(AppError::BadRequest("session_keys 为空".into()));
+    }
+    let total = req.session_keys.len();
+    let limit = req.concurrency_limit.unwrap_or(5).clamp(1, 30);
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(limit));
+    let mut joins = tokio::task::JoinSet::new();
+
+    for sk in req.session_keys.iter().cloned() {
+        let sem = semaphore.clone();
+        let state = state.clone();
+        let item = CookieAuthCreateRequest {
+            session_key: sk.clone(),
+            proxy_url: req.proxy_url.clone(),
+            scope: req.scope.clone(),
+            name: None,
+            priority: req.priority,
+            concurrency: req.concurrency,
+            billing_mode: req.billing_mode.clone(),
+            auto_telemetry: req.auto_telemetry,
+            subscription_type: req.subscription_type.clone(),
+        };
+        joins.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            let preview = mask_session_key(&sk);
+            match build_account_from_cookie_auth(&state, &item).await {
+                Ok(account) => BatchItemResult {
+                    session_key_preview: preview,
+                    success: true,
+                    account_id: Some(account.id),
+                    email: Some(account.email),
+                    error: None,
+                },
+                Err(e) => BatchItemResult {
+                    session_key_preview: preview,
+                    success: false,
+                    account_id: None,
+                    email: None,
+                    error: Some(e.to_string()),
+                },
+            }
+        });
+    }
+
+    let mut results = Vec::with_capacity(total);
+    while let Some(join_res) = joins.join_next().await {
+        match join_res {
+            Ok(item) => results.push(item),
+            Err(e) => results.push(BatchItemResult {
+                session_key_preview: "?".into(),
+                success: false,
+                account_id: None,
+                email: None,
+                error: Some(format!("task panic: {}", e)),
+            }),
+        }
+    }
+
+    let success = results.iter().filter(|r| r.success).count();
+    let failed = total - success;
+    Ok(Json(CookieAuthCreateBatchResponse {
+        total,
+        success,
+        failed,
+        results,
+    }))
+}
+
+// --- OpenAI 账号入库 Handlers (Phase 2) ---
+
+#[derive(Deserialize)]
+struct OpenAIAccountCreateRequest {
+    /// 账号显示名 (默认空, 后端会兜底)
+    #[serde(default)]
+    name: Option<String>,
+    /// 必填: email 标识 (用作 unique key)
+    email: String,
+    /// 凭证类型: "api_key" / "codex_token" / "oauth" / "cookie" (cookie 仅占位, 短期当 api_key 处理)
+    #[serde(default)]
+    credential_type: Option<String>,
+    /// API Key (sk-* 或 sk-proj-*); 也用于存 codex_token
+    #[serde(default)]
+    api_key: Option<String>,
+    /// OAuth access_token (auth_type=oauth 时用)
+    #[serde(default)]
+    access_token: Option<String>,
+    /// OAuth refresh_token
+    #[serde(default)]
+    refresh_token: Option<String>,
+    /// 自定义 base_url (默认 https://api.openai.com)
+    #[serde(default)]
+    base_url: Option<String>,
+    /// 强制 User-Agent (codex 默认走 codex_cli_rs/0.104.0)
+    #[serde(default)]
+    user_agent: Option<String>,
+    /// ChatGPT account_id (OAuth 账号必填, 走 chatgpt.com 时要)
+    #[serde(default)]
+    chatgpt_account_id: Option<String>,
+    /// organization_id (OpenAI-Organization-Id header 用)
+    #[serde(default)]
+    organization_id: Option<String>,
+    /// 代理
+    #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    concurrency: Option<i32>,
+}
+
+async fn create_openai_account(
+    State(state): State<AppState>,
+    Json(req): Json<OpenAIAccountCreateRequest>,
+) -> Result<(StatusCode, Json<Account>), AppError> {
+    if req.email.trim().is_empty() {
+        return Err(AppError::BadRequest("email is required".into()));
+    }
+    let credential_type = req
+        .credential_type
+        .clone()
+        .unwrap_or_else(|| "api_key".into());
+
+    // auth_type 映射: api_key / codex_token / cookie → setup_token (单 token 鉴权)
+    //                oauth → oauth (双 token + 自动刷新)
+    let auth_type = match credential_type.as_str() {
+        "oauth" => AccountAuthType::Oauth,
+        _ => AccountAuthType::SetupToken,
+    };
+
+    // 构造 extra (平台特有字段塞这里)
+    let mut extra = serde_json::Map::new();
+    extra.insert("credential_type".into(), serde_json::json!(credential_type));
+    if let Some(b) = req.base_url.as_ref().filter(|s| !s.is_empty()) {
+        extra.insert("base_url".into(), serde_json::json!(b));
+    }
+    if let Some(ua) = req.user_agent.as_ref().filter(|s| !s.is_empty()) {
+        extra.insert("user_agent".into(), serde_json::json!(ua));
+    }
+    if let Some(cid) = req.chatgpt_account_id.as_ref().filter(|s| !s.is_empty()) {
+        extra.insert("chatgpt_account_id".into(), serde_json::json!(cid));
+    }
+    if let Some(oid) = req.organization_id.as_ref().filter(|s| !s.is_empty()) {
+        extra.insert("organization_id".into(), serde_json::json!(oid));
+    }
+
+    // 校验: 至少要一个 token
+    let setup_token = req.api_key.clone().unwrap_or_default();
+    let access_token = req.access_token.clone().unwrap_or_default();
+    if setup_token.is_empty() && access_token.is_empty() {
+        return Err(AppError::BadRequest(
+            "需提供 api_key (api_key/codex_token 模式) 或 access_token (oauth 模式)".into(),
+        ));
+    }
+
+    let mut account = Account {
+        id: 0,
+        name: req
+            .name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| req.email.clone()),
+        email: req.email,
+        status: AccountStatus::Active,
+        auth_type,
+        setup_token,
+        access_token,
+        refresh_token: req.refresh_token.unwrap_or_default(),
+        expires_at: None,
+        oauth_refreshed_at: None,
+        auth_error: String::new(),
+        proxy_url: req.proxy_url.unwrap_or_default(),
+        device_id: String::new(),
+        canonical_env: serde_json::json!({}),
+        canonical_prompt: serde_json::json!({}),
+        canonical_process: serde_json::json!({}),
+        billing_mode: crate::model::account::BillingMode::Strip,
+        account_uuid: None,
+        organization_uuid: None,
+        subscription_type: None,
+        concurrency: req.concurrency.unwrap_or(3),
+        priority: req.priority.unwrap_or(50),
+        rate_limited_at: None,
+        rate_limit_reset_at: None,
+        disable_reason: String::new(),
+        auto_telemetry: false,
+        telemetry_count: 0,
+        usage_data: serde_json::json!({}),
+        usage_fetched_at: None,
+        platform: "openai".into(),
+        extra: serde_json::Value::Object(extra),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    state.account_svc.create_account(&mut account).await?;
+    Ok((StatusCode::CREATED, Json(account)))
+}
+
+// --- OpenAI 用量探测 (Phase 9) ---
+// 从 ChatGPT codex/responses 响应头解析限流信息
+// sub2api ParseCodexRateLimitHeaders 移植: 关注 5h 和 7d 滚动窗口
+fn parse_codex_rate_limit_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<serde_json::Value> {
+    fn get(h: &reqwest::header::HeaderMap, key: &str) -> Option<String> {
+        h.get(key).and_then(|v| v.to_str().ok()).map(String::from)
+    }
+
+    let mut updates = serde_json::Map::new();
+    let now = chrono::Utc::now().timestamp();
+    updates.insert("codex_usage_updated_at".into(), serde_json::json!(now));
+
+    // ChatGPT 响应头里常见的限流字段:
+    //   x-codex-primary-used-percent / x-codex-primary-window-minutes / x-codex-primary-reset-after-seconds
+    //   x-codex-secondary-used-percent / ...
+    //   x-codex-account-rate-limit-* (备用)
+    let mut got_any = false;
+
+    if let Some(p) = get(headers, "x-codex-primary-used-percent")
+        .and_then(|s| s.parse::<f64>().ok())
+    {
+        updates.insert("codex_usage_5h_used_percent".into(), serde_json::json!(p));
+        got_any = true;
+    }
+    if let Some(p) = get(headers, "x-codex-primary-window-minutes")
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        updates.insert("codex_usage_5h_window_minutes".into(), serde_json::json!(p));
+        got_any = true;
+    }
+    if let Some(p) = get(headers, "x-codex-primary-reset-after-seconds")
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        updates.insert("codex_usage_5h_reset_after_seconds".into(), serde_json::json!(p));
+        updates.insert(
+            "codex_usage_5h_reset_at".into(),
+            serde_json::json!(now + p),
+        );
+        got_any = true;
+    }
+
+    if let Some(p) = get(headers, "x-codex-secondary-used-percent")
+        .and_then(|s| s.parse::<f64>().ok())
+    {
+        updates.insert("codex_usage_7d_used_percent".into(), serde_json::json!(p));
+        got_any = true;
+    }
+    if let Some(p) = get(headers, "x-codex-secondary-window-minutes")
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        updates.insert("codex_usage_7d_window_minutes".into(), serde_json::json!(p));
+        got_any = true;
+    }
+    if let Some(p) = get(headers, "x-codex-secondary-reset-after-seconds")
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        updates.insert("codex_usage_7d_reset_after_seconds".into(), serde_json::json!(p));
+        updates.insert(
+            "codex_usage_7d_reset_at".into(),
+            serde_json::json!(now + p),
+        );
+        got_any = true;
+    }
+
+    if got_any {
+        Some(serde_json::Value::Object(updates))
+    } else {
+        None
+    }
+}
+
+/// 把探测到的 usage 字段 merge 到 account.extra 并落库
+async fn persist_codex_usage(
+    account_svc: Arc<AccountService>,
+    account_id: i64,
+    usage_update: serde_json::Value,
+) -> Result<(), AppError> {
+    let mut account = account_svc.get_account(account_id).await?;
+    let mut current = match account.extra.as_object() {
+        Some(o) => o.clone(),
+        None => serde_json::Map::new(),
+    };
+    if let Some(updates) = usage_update.as_object() {
+        for (k, v) in updates.iter() {
+            current.insert(k.clone(), v.clone());
+        }
+    }
+    account.extra = serde_json::Value::Object(current);
+    account_svc.update_account(&account).await?;
+    Ok(())
+}
+
+/// 把 codex_429_until merge 到 account.extra 并落库
+async fn persist_codex_429_until(
+    account_svc: Arc<AccountService>,
+    account_id: i64,
+    until_unix: i64,
+) -> Result<(), AppError> {
+    let mut account = account_svc.get_account(account_id).await?;
+    account.extra = crate::service::openai_limit::merge_429_into_extra(&account.extra, until_unix);
+    account_svc.update_account(&account).await?;
+    Ok(())
+}
+
+/// POST /admin/accounts/:id/openai-usage/probe
+/// 主动发探测请求拉用量 (复用 chat_completions 同款链路, 但 body 是最小测试请求)
+async fn openai_usage_probe(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let account = state.account_svc.get_account(id).await?;
+    if account.platform != "openai" {
+        return Err(AppError::BadRequest("only openai accounts support probe".into()));
+    }
+    if account.auth_type != AccountAuthType::Oauth {
+        return Err(AppError::BadRequest(
+            "only OAuth accounts have codex usage; API key accounts have no usage to probe".into(),
+        ));
+    }
+    if account.access_token.is_empty() {
+        return Err(AppError::BadRequest("account has no access_token".into()));
+    }
+
+    let chatgpt_account_id = account
+        .extra
+        .as_object()
+        .and_then(|m| m.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let probe_body = serde_json::json!({
+        "model": "gpt-5",
+        "instructions": "ping",
+        "input": [{"role":"user","content":[{"type":"input_text","text":"ping"}]}],
+        "max_output_tokens": 1,
+        "stream": false,
+        "store": false,
+    });
+
+    let client = crate::tlsfp::make_request_client(&account.proxy_url);
+    let mut up_req = client
+        .post("https://chatgpt.com/backend-api/codex/responses")
+        .header("Authorization", format!("Bearer {}", account.access_token))
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream")
+        .header("Host", "chatgpt.com")
+        .header("OpenAI-Beta", "responses=experimental")
+        .header("Originator", "codex_cli_rs")
+        .header("Version", "0.104.0")
+        .header("User-Agent", "codex_cli_rs/0.104.0")
+        .json(&probe_body);
+    if !chatgpt_account_id.is_empty() {
+        up_req = up_req.header("chatgpt-account-id", chatgpt_account_id);
+    }
+
+    let resp = up_req
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("probe request failed: {}", e)))?;
+
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+
+    let usage = parse_codex_rate_limit_headers(&headers);
+    if let Some(ref u) = usage {
+        let _ = persist_codex_usage(state.account_svc.clone(), id, u.clone()).await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": status,
+        "usage": usage,
+        "found": usage.is_some(),
+    })))
+}
+
+// --- OpenAI Refresh Token 一键导入 (Phase 7+, 对齐 sub2api 主流模式) ---
+
+#[derive(Deserialize, Clone)]
+struct OpenAIRtImportRequest {
+    /// 必填: refresh_token (sk-... 或 chatgpt 内部 token)
+    refresh_token: String,
+    /// 可选: 自定义 email (默认从 id_token 解析)
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    concurrency: Option<i32>,
+}
+
+async fn build_openai_account_from_rt(
+    state: &AppState,
+    req: &OpenAIRtImportRequest,
+) -> Result<Account, AppError> {
+    // 用 refresh_token 跑一次 refresh, 拿 access_token + 解析 id_token
+    let proxy = req.proxy_url.as_deref().unwrap_or("");
+    let token = state
+        .openai_oauth_svc
+        .refresh_token(&req.refresh_token, proxy)
+        .await?;
+
+    // email 优先用户自定义, 否则从 id_token 解析, 都没有则用 chatgpt_account_id 兜底
+    let email = req
+        .email
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            if !token.email.is_empty() {
+                Some(token.email.clone())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            if !token.chatgpt_account_id.is_empty() {
+                Some(format!("chatgpt-{}@openai", token.chatgpt_account_id))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            AppError::Internal("无法确定 email (id_token 没有 email 字段, 请显式传 email)".into())
+        })?;
+
+    let mut extra = serde_json::Map::new();
+    extra.insert("credential_type".into(), serde_json::json!("oauth_rt"));
+    if let Some(b) = req.base_url.as_ref().filter(|s| !s.is_empty()) {
+        extra.insert("base_url".into(), serde_json::json!(b));
+    }
+    if let Some(ua) = req.user_agent.as_ref().filter(|s| !s.is_empty()) {
+        extra.insert("user_agent".into(), serde_json::json!(ua));
+    }
+    if !token.chatgpt_account_id.is_empty() {
+        extra.insert(
+            "chatgpt_account_id".into(),
+            serde_json::json!(token.chatgpt_account_id),
+        );
+    }
+    if !token.organization_id.is_empty() {
+        extra.insert(
+            "organization_id".into(),
+            serde_json::json!(token.organization_id),
+        );
+    }
+    if !token.plan_type.is_empty() {
+        extra.insert("plan_type".into(), serde_json::json!(token.plan_type));
+    }
+    if !token.subscription_expires_at.is_empty() {
+        extra.insert(
+            "subscription_expires_at".into(),
+            serde_json::json!(token.subscription_expires_at),
+        );
+    }
+    if !token.privacy_mode.is_empty() {
+        extra.insert("privacy_mode".into(), serde_json::json!(token.privacy_mode));
+    }
+
+    let expires_at = Utc.timestamp_opt(token.expires_at, 0).single();
+    let mut account = Account {
+        id: 0,
+        name: email.clone(),
+        email,
+        status: AccountStatus::Active,
+        auth_type: AccountAuthType::Oauth,
+        setup_token: String::new(),
+        access_token: token.access_token,
+        refresh_token: if token.refresh_token.is_empty() {
+            req.refresh_token.clone()
+        } else {
+            token.refresh_token
+        },
+        expires_at,
+        oauth_refreshed_at: None,
+        auth_error: String::new(),
+        proxy_url: req.proxy_url.clone().unwrap_or_default(),
+        device_id: String::new(),
+        canonical_env: serde_json::json!({}),
+        canonical_prompt: serde_json::json!({}),
+        canonical_process: serde_json::json!({}),
+        billing_mode: crate::model::account::BillingMode::Strip,
+        account_uuid: None,
+        organization_uuid: None,
+        subscription_type: None,
+        concurrency: req.concurrency.unwrap_or(3),
+        priority: req.priority.unwrap_or(50),
+        rate_limited_at: None,
+        rate_limit_reset_at: None,
+        disable_reason: String::new(),
+        auto_telemetry: false,
+        telemetry_count: 0,
+        usage_data: serde_json::json!({}),
+        usage_fetched_at: None,
+        platform: "openai".into(),
+        extra: serde_json::Value::Object(extra),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    state.account_svc.create_account(&mut account).await?;
+    Ok(account)
+}
+
+/// POST /admin/accounts/openai-rt-import (单个 refresh_token)
+async fn openai_rt_import(
+    State(state): State<AppState>,
+    Json(req): Json<OpenAIRtImportRequest>,
+) -> Result<(StatusCode, Json<Account>), AppError> {
+    let account = build_openai_account_from_rt(&state, &req).await?;
+    Ok((StatusCode::CREATED, Json(account)))
+}
+
+#[derive(Deserialize)]
+struct OpenAIRtImportBatchRequest {
+    refresh_tokens: Vec<String>,
+    #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    concurrency_limit: Option<usize>,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    concurrency: Option<i32>,
+}
+
+#[derive(serde::Serialize)]
+struct OpenAIRtBatchItem {
+    rt_preview: String,
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct OpenAIRtBatchResponse {
+    total: usize,
+    success: usize,
+    failed: usize,
+    results: Vec<OpenAIRtBatchItem>,
+}
+
+/// POST /admin/accounts/openai-rt-import/batch (多个 refresh_token, 并发控制)
+async fn openai_rt_import_batch(
+    State(state): State<AppState>,
+    Json(req): Json<OpenAIRtImportBatchRequest>,
+) -> Result<Json<OpenAIRtBatchResponse>, AppError> {
+    if req.refresh_tokens.is_empty() {
+        return Err(AppError::BadRequest("refresh_tokens 为空".into()));
+    }
+    let total = req.refresh_tokens.len();
+    let limit = req.concurrency_limit.unwrap_or(3).clamp(1, 10);
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(limit));
+    let mut joins = tokio::task::JoinSet::new();
+
+    for rt in req.refresh_tokens.iter().cloned() {
+        let sem = semaphore.clone();
+        let state = state.clone();
+        let item = OpenAIRtImportRequest {
+            refresh_token: rt.clone(),
+            email: None,
+            proxy_url: req.proxy_url.clone(),
+            user_agent: req.user_agent.clone(),
+            base_url: req.base_url.clone(),
+            priority: req.priority,
+            concurrency: req.concurrency,
+        };
+        joins.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            let preview = mask_session_key(&rt);
+            match build_openai_account_from_rt(&state, &item).await {
+                Ok(account) => OpenAIRtBatchItem {
+                    rt_preview: preview,
+                    success: true,
+                    account_id: Some(account.id),
+                    email: Some(account.email),
+                    error: None,
+                },
+                Err(e) => OpenAIRtBatchItem {
+                    rt_preview: preview,
+                    success: false,
+                    account_id: None,
+                    email: None,
+                    error: Some(e.to_string()),
+                },
+            }
+        });
+    }
+
+    let mut results = Vec::with_capacity(total);
+    while let Some(j) = joins.join_next().await {
+        match j {
+            Ok(item) => results.push(item),
+            Err(e) => results.push(OpenAIRtBatchItem {
+                rt_preview: "?".into(),
+                success: false,
+                account_id: None,
+                email: None,
+                error: Some(format!("task panic: {}", e)),
+            }),
+        }
+    }
+
+    let success = results.iter().filter(|r| r.success).count();
+    let failed = total - success;
+    Ok(Json(OpenAIRtBatchResponse {
+        total,
+        success,
+        failed,
+        results,
+    }))
+}
+
+// --- OpenAI OAuth Handlers (Phase 4) ---
+
+async fn openai_oauth_generate_auth_url(
+    State(state): State<AppState>,
+    Json(req): Json<crate::service::openai_oauth::OpenAIGenerateAuthUrlRequest>,
+) -> Json<crate::service::openai_oauth::OpenAIGenerateAuthUrlResponse> {
+    Json(state.openai_oauth_svc.generate_auth_url(&req))
+}
+
+async fn openai_oauth_exchange_code(
+    State(state): State<AppState>,
+    Json(req): Json<crate::service::openai_oauth::OpenAIExchangeCodeRequest>,
+) -> Result<Json<crate::service::openai_oauth::OpenAIExchangeCodeResponse>, AppError> {
+    let resp = state.openai_oauth_svc.exchange_code(&req).await?;
+    Ok(Json(resp))
+}
+
+#[derive(Deserialize)]
+struct OpenAIRefreshTokenRequest {
+    refresh_token: String,
+    #[serde(default)]
+    proxy_url: Option<String>,
+}
+
+async fn openai_oauth_refresh_token(
+    State(state): State<AppState>,
+    Json(req): Json<OpenAIRefreshTokenRequest>,
+) -> Result<Json<crate::service::openai_oauth::OpenAIExchangeCodeResponse>, AppError> {
+    let proxy = req.proxy_url.as_deref().unwrap_or("");
+    let resp = state
+        .openai_oauth_svc
+        .refresh_token(&req.refresh_token, proxy)
+        .await?;
+    Ok(Json(resp))
+}
+
+// --- 健康检查 + Metrics ---
+
+/// `/livez` — 进程是否存活。永远 200,只要这条 handler 能跑就说明 axum / tokio 没死。
+async fn livez_handler() -> Response {
+    (StatusCode::OK, "ok").into_response()
+}
+
+/// `/readyz` — 是否准备好接业务流量。需要 DB ping 通过。
+async fn readyz_handler(State(state): State<AppState>) -> Response {
+    match state.account_svc.ping_db().await {
+        Ok(_) => (StatusCode::OK, "ready").into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("db: {}", e),
+        )
+            .into_response(),
+    }
+}
+
+/// `/metrics` — Prometheus 文本格式指标暴露。
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    use crate::model::account::AccountStatus;
+    use crate::service::metrics::{AccountsByStatus, METRICS};
+
+    // 即时读账号状态分布 (从 list_schedulable cache + DB 拿;失败时 gauges 全 0)
+    let mut acc = AccountsByStatus::default();
+    if let Ok(accounts) = state.account_svc.list_accounts().await {
+        for a in &accounts {
+            let claude = a.platform.is_empty() || a.platform == "claude";
+            let openai = a.platform == "openai";
+            match a.status {
+                AccountStatus::Active => {
+                    if claude {
+                        acc.claude_active += 1;
+                    } else if openai {
+                        acc.openai_active += 1;
+                    }
+                }
+                AccountStatus::Error => {
+                    if claude {
+                        acc.claude_error += 1;
+                    } else if openai {
+                        acc.openai_error += 1;
+                    }
+                }
+                AccountStatus::Disabled => {
+                    if claude {
+                        acc.claude_disabled += 1;
+                    } else if openai {
+                        acc.openai_disabled += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let body = METRICS.render(&acc);
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        body,
+    )
+        .into_response()
 }
 
 // --- 内嵌前端静态资源 ---

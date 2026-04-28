@@ -2,7 +2,7 @@ name: Build & Release
 
 on:
   push:
-    branches: [main]
+    branches: [ccb]
     paths: ['.version']
   workflow_dispatch:
 
@@ -174,6 +174,22 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # 打包部署脚本 (scripts/ + deploy/ + .env.example) 给 bootstrap.sh 使用
+      - name: Package deploy bundle
+        run: |
+          mkdir -p staging-deploy
+          cp -r scripts staging-deploy/
+          cp -r deploy staging-deploy/
+          cp .env.example staging-deploy/
+          # 在 staging-deploy 根目录放一份顶层 README (优先 deploy/README.md, 退化用 deploy 目录文件)
+          if [ -f deploy/README.md ]; then
+            cp deploy/README.md staging-deploy/README.md
+          fi
+          chmod +x staging-deploy/scripts/*.sh
+          tar czf cc-bridge-deploy.tar.gz -C staging-deploy .
+          sha256sum cc-bridge-deploy.tar.gz > cc-bridge-deploy.tar.gz.sha256
+          ls -la cc-bridge-deploy.*
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -183,3 +199,5 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.zip
+            cc-bridge-deploy.tar.gz
+            cc-bridge-deploy.tar.gz.sha256

@@ -1,0 +1,50 @@
+[Unit]
+Description=cc-bridge AI gateway
+Documentation=https://github.com/YOUR_GH_USER/cc-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ccbridge
+Group=ccbridge
+WorkingDirectory=/opt/cc-bridge
+EnvironmentFile=/opt/cc-bridge/.env
+ExecStart=/opt/cc-bridge/cc-bridge
+
+# 重启策略
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Graceful shutdown: SIGTERM, 给 30s 排空 in-flight (binary 已实现 with_graceful_shutdown)
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# 资源限制 (可按需调)
+LimitNOFILE=65536
+TasksMax=4096
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/opt/cc-bridge/data
+
+# 日志走 journald (默认), 可用 journalctl -u cc-bridge -f 看
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

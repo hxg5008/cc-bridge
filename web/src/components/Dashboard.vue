@@ -25,6 +25,26 @@ function formatNum(n: number): string {
   return n.toLocaleString();
 }
 
+function platformLabel(p: string): string {
+  switch (p) {
+    case 'claude': return 'Anthropic';
+    case 'openai': return 'OpenAI';
+    case 'gemini': return 'Gemini';
+    case 'antigravity': return 'Antigravity';
+    default: return p;
+  }
+}
+
+function platformBadgeClass(p: string): string {
+  switch (p) {
+    case 'claude': return 'bg-orange-100 text-orange-700';
+    case 'openai': return 'bg-emerald-100 text-emerald-700';
+    case 'gemini': return 'bg-blue-100 text-blue-700';
+    case 'antigravity': return 'bg-purple-100 text-purple-700';
+    default: return 'bg-gray-100 text-gray-700';
+  }
+}
+
 onMounted(loadDashboard);
 </script>
 
@@ -77,6 +97,13 @@ onMounted(loadDashboard);
           <CardContent class="py-3 px-4">
             <p class="text-[#8c8475] text-xs mb-1">总账号</p>
             <p class="text-2xl font-bold text-[#29261e]">{{ formatNum(dashboard.accounts.total) }}</p>
+            <div v-if="dashboard.accounts.by_platform" class="flex flex-wrap gap-1 mt-1">
+              <span v-for="(count, platform) in dashboard.accounts.by_platform" :key="platform"
+                class="px-1.5 py-0.5 rounded text-[10px] font-medium"
+                :class="platformBadgeClass(platform as string)">
+                {{ platformLabel(platform as string) }} {{ count }}
+              </span>
+            </div>
           </CardContent>
         </Card>
         <Card class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 !py-0 !gap-0">

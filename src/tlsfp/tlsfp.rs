@@ -346,7 +346,14 @@ fn make_request_client_with_read_timeout(
         .no_proxy();
 
     if !proxy_url.is_empty() {
-        if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
+        // 自动补全协议前缀: 用户从 UI 粘 user:pass@host:port 时可能漏掉 http://
+        // 不补全的话 reqwest::Proxy::all 解析失败 → 静默忽略代理 → 请求直连
+        let normalized = if proxy_url.contains("://") {
+            proxy_url.to_string()
+        } else {
+            format!("http://{}", proxy_url)
+        };
+        if let Ok(proxy) = reqwest::Proxy::all(&normalized) {
             builder = builder.proxy(proxy);
         }
     }

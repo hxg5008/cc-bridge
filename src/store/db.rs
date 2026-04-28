@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
     if driver == "sqlite" {
@@ -97,7 +97,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     let json_type = if driver == "sqlite" { "TEXT" } else { "JSONB" };
     let cols = existing_columns(pool, driver, "accounts").await;
 
-    let pending: [(&str, String); 15] = [
+    let pending: [(&str, String); 17] = [
         (
             "billing_mode",
             "ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'".into(),
@@ -157,6 +157,16 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         (
             "telemetry_count",
             "ALTER TABLE accounts ADD COLUMN telemetry_count INTEGER NOT NULL DEFAULT 0".into(),
+        ),
+        // Phase 1 (multi-platform): 加 platform 字段, 默认 claude (向后兼容现有账号)
+        (
+            "platform",
+            "ALTER TABLE accounts ADD COLUMN platform TEXT NOT NULL DEFAULT 'claude'".into(),
+        ),
+        // Phase 1: 加 extra JSONB 字段, 平台特有数据 (openai_passthrough / ua_override 等)
+        (
+            "extra",
+            format!("ALTER TABLE accounts ADD COLUMN extra {} NOT NULL DEFAULT '{{}}'", json_type),
         ),
     ];
     for (name, sql) in pending.iter() {
@@ -280,6 +290,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     telemetry_count      INTEGER NOT NULL DEFAULT 0,
     usage_data           TEXT NOT NULL DEFAULT '{}',
     usage_fetched_at     TEXT,
+    platform        TEXT NOT NULL DEFAULT 'claude',
+    extra           TEXT NOT NULL DEFAULT '{}',
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
@@ -317,6 +329,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     telemetry_count      BIGINT NOT NULL DEFAULT 0,
     usage_data           JSONB NOT NULL DEFAULT '{}',
     usage_fetched_at     TIMESTAMPTZ,
+    platform        TEXT NOT NULL DEFAULT 'claude',
+    extra           JSONB NOT NULL DEFAULT '{}',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

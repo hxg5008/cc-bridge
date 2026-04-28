@@ -1,0 +1,72 @@
+#cloud-config
+# cc-bridge cloud-init 配置 — 机器创建时自动装好
+#
+# 用法 (各家云厂商 "User Data" 字段填这个文件内容):
+#   - AWS EC2: 控制台 → Advanced details → User data
+#   - Hetzner Cloud: Cloud config 字段
+#   - Vultr: Startup Script (类型 "Boot Script")
+#   - Oracle Cloud: Advanced options → Initialization script
+#   - DigitalOcean: User data
+#
+# 部署后:
+#   - 自动跑 install.sh, 装 binary + systemd + 默认 .env
+#   - 默认密码写在 /opt/cc-bridge/.env, 可通过 SSH 查看
+#   - 服务监听 127.0.0.1:5674, 需自己装反代 + TLS
+#
+# 改下面的 GH_TOKEN_VALUE 和 CC_BRIDGE_REPO!
+
+write_files:
+  - path: /etc/profile.d/cc-bridge-env.sh
+    permissions: '0644'
+    content: |
+      # 给后续 SSH 进来的运维用户也能拿到 token (升级时需要)
+      export GH_TOKEN=GH_TOKEN_VALUE_HERE
+      export CC_BRIDGE_REPO=YOUR_GH_USER/cc-bridge
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - curl
+  - ca-certificates
+  - tar
+  - caddy   # 自动 TLS 反代 (要先在 sources 里加 Caddy repo, 见 runcmd)
+
+runcmd:
+  # 装 Caddy
+  - |
+    apt install -y debian-keyring debian-archive-keyring apt-transport-https
+    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+      | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
+      | tee /etc/apt/sources.list.d/caddy-stable.list
+    apt update && apt install -y caddy
+
+  # 一行命令装 cc-bridge
+  - |
+    GH_TOKEN=GH_TOKEN_VALUE_HERE \
+    CC_BRIDGE_REPO=YOUR_GH_USER/cc-bridge \
+    bash -c 'curl -fsSL https://raw.githubusercontent.com/YOUR_GH_USER/cc-bridge/ccb/scripts/bootstrap.sh | bash'
+
+  # 配 Caddy (替换 api.example.com 为你的域名)
+  - |
+    cat > /etc/caddy/Caddyfile <<'EOF'
+    api.example.com {
+        reverse_proxy 127.0.0.1:5674 {
+            flush_interval -1
+        }
+        @internal path /livez /readyz /metrics
+        handle @internal { respond 404 }
+        encode zstd gzip
+    }
+    EOF
+    systemctl reload caddy
+
+  # 防火墙
+  - ufw default deny incoming
+  - ufw allow 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw --force enable
+
+final_message: "cc-bridge deployment finished after $UPTIME seconds. ssh in and check /opt/cc-bridge/.env for ADMIN_PASSWORD"

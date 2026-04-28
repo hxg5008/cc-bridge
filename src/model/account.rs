@@ -185,8 +185,18 @@ pub struct Account {
     pub usage_data: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_fetched_at: Option<DateTime<Utc>>,
+    /// 平台标识: "claude" / "openai" / 未来扩展。默认 "claude" 向后兼容。
+    #[serde(default = "default_platform")]
+    pub platform: String,
+    /// 平台特有数据 (openai_passthrough / ua_override / chatgpt_account_id 等)。
+    #[serde(default)]
+    pub extra: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_platform() -> String {
+    "claude".to_string()
 }
 
 fn default_concurrency() -> i32 {

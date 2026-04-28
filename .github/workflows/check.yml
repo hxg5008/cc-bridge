@@ -2,9 +2,9 @@ name: CI Check
 
 on:
   push:
-    branches: [main]
+    branches: [ccb]
   pull_request:
-    branches: [main]
+    branches: [ccb]
   workflow_dispatch:
 
 concurrency:

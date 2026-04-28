@@ -18,6 +18,9 @@ const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
+// SessionKey-based 自动 OAuth 用的 claude.ai 内部接口
+const ORGANIZATIONS_URL: &str = "https://claude.ai/api/organizations";
+const AUTHORIZE_API_URL: &str = "https://claude.ai/v1/oauth/{}/authorize";
 
 const SCOPE_FULL: &str =
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
@@ -171,6 +174,52 @@ struct TokenOrganization {
 }
 
 // ---------------------------------------------------------------------------
+// SessionKey-based 自动 OAuth 请求 / 响应
+// ---------------------------------------------------------------------------
+
+/// 用 sessionKey 自动跑完三步 OAuth 流程的请求体。
+#[derive(Deserialize)]
+pub struct CookieAuthRequest {
+    pub session_key: String,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// "full" (默认) 或 "inference" (Setup Token 模式)。
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// CookieAuth 成功后的响应（与 ExchangeCodeResponse 字段一致）。
+#[derive(Serialize, Clone)]
+pub struct CookieAuthResponse {
+    pub access_token: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub refresh_token: String,
+    pub expires_in: i64,
+    pub expires_at: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub account_uuid: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub organization_uuid: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub email_address: String,
+}
+
+#[derive(Deserialize)]
+struct AuthorizeApiResponse {
+    redirect_uri: String,
+}
+
+/// 简易 organization 字段反序列化。
+#[derive(Deserialize)]
+struct ClaudeOrganization {
+    uuid: String,
+    #[serde(default)]
+    raven_type: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // OAuthFlowService
 // ---------------------------------------------------------------------------
 
@@ -213,6 +262,56 @@ impl OAuthFlowService {
         req: &ExchangeCodeRequest,
     ) -> Result<ExchangeCodeResponse, AppError> {
         self.do_exchange(&req.session_id, &req.code, true).await
+    }
+
+    /// SessionKey-based 自动 OAuth: 三步走完, 直接返回 token 信息。
+    /// 不依赖 SessionStore (无浏览器流程)。
+    pub async fn cookie_auth(
+        &self,
+        req: &CookieAuthRequest,
+    ) -> Result<CookieAuthResponse, AppError> {
+        if req.session_key.trim().is_empty() {
+            return Err(AppError::BadRequest("session_key 为空".into()));
+        }
+        let proxy = req.proxy_url.as_deref().unwrap_or("");
+        let is_setup_token = matches!(req.scope.as_deref(), Some("inference"));
+        let scope = if is_setup_token {
+            SCOPE_INFERENCE
+        } else {
+            SCOPE_FULL
+        };
+
+        // Step 1: 拿 organization uuid
+        let org_uuid = fetch_organization_uuid(&req.session_key, proxy).await?;
+        debug!("cookie_auth: 选中组织 {}", org_uuid);
+
+        // Step 2: 生成 PKCE 三件套
+        let state = generate_state();
+        let code_verifier = generate_code_verifier();
+        let code_challenge = generate_code_challenge(&code_verifier);
+
+        // Step 3: 用 sessionKey + PKCE 拿 authorization code
+        let raw_code = fetch_authorization_code(
+            &req.session_key,
+            &org_uuid,
+            scope,
+            &code_challenge,
+            &state,
+            proxy,
+        )
+        .await?;
+        debug!("cookie_auth: 已拿到 authorization code");
+
+        // Step 4: 交换 token
+        exchange_for_token(
+            &raw_code,
+            &code_verifier,
+            &state,
+            proxy,
+            is_setup_token,
+            &org_uuid,
+        )
+        .await
     }
 
     // --- 内部实现 ---
@@ -363,4 +462,301 @@ fn percent_encode(input: &str) -> String {
         }
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// SessionKey-based 自动 OAuth 私有辅助函数
+// ---------------------------------------------------------------------------
+
+/// 网络层重试次数 (claude.ai 在并发下偶发抽风, 重试 1-2 次能消化大部分瞬时抖动)。
+/// 仅对 AppError::Internal (网络/解析层) 重试; AppError::BadRequest (401/403)
+/// 视为真正失效, 不重试。
+const NETWORK_RETRIES: u32 = 2;
+
+/// Step 1: 用 sessionKey 拉 organizations 列表, 优先返回 raven_type=team 的 uuid,
+/// 否则返回第一个组织。
+async fn fetch_organization_uuid(session_key: &str, proxy_url: &str) -> Result<String, AppError> {
+    let mut last_err: Option<AppError> = None;
+    for attempt in 1u32..=(NETWORK_RETRIES + 1) {
+        match fetch_organization_uuid_once(session_key, proxy_url).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                // sessionKey 真的失效 (401/403) → 不重试
+                if matches!(&e, AppError::BadRequest(_)) {
+                    return Err(e);
+                }
+                last_err = Some(e);
+                if attempt <= NETWORK_RETRIES {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        800 * attempt as u64,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AppError::Internal("unknown".into())))
+}
+
+async fn fetch_organization_uuid_once(
+    session_key: &str,
+    proxy_url: &str,
+) -> Result<String, AppError> {
+    let client = crate::tlsfp::make_request_client(proxy_url);
+    let resp = client
+        .get(ORGANIZATIONS_URL)
+        .header("Cookie", format!("sessionKey={}", session_key))
+        .header("Accept", "application/json")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        )
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("organizations request failed: {}", e)))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(match status.as_u16() {
+            401 | 403 => AppError::BadRequest(format!(
+                "sessionKey 无效或已过期 (status {}): {}",
+                status, text
+            )),
+            _ => AppError::Internal(format!("organizations failed: status {} {}", status, text)),
+        });
+    }
+
+    let orgs: Vec<ClaudeOrganization> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("organizations parse failed: {}", e)))?;
+
+    if orgs.is_empty() {
+        return Err(AppError::BadRequest("账号下没有组织".into()));
+    }
+
+    // 优先 raven_type == "team", 否则第一个
+    let chosen = orgs
+        .iter()
+        .find(|o| o.raven_type.as_deref() == Some("team"))
+        .unwrap_or(&orgs[0]);
+    Ok(chosen.uuid.clone())
+}
+
+/// Step 2: 用 sessionKey 调 /v1/oauth/{org}/authorize 拿 redirect_uri 中的
+/// authorization code (code+state 拼接为 "code#state")。
+async fn fetch_authorization_code(
+    session_key: &str,
+    org_uuid: &str,
+    scope: &str,
+    code_challenge: &str,
+    state: &str,
+    proxy_url: &str,
+) -> Result<String, AppError> {
+    let mut last_err: Option<AppError> = None;
+    for attempt in 1u32..=(NETWORK_RETRIES + 1) {
+        match fetch_authorization_code_once(
+            session_key,
+            org_uuid,
+            scope,
+            code_challenge,
+            state,
+            proxy_url,
+        )
+        .await
+        {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if matches!(&e, AppError::BadRequest(_)) {
+                    return Err(e);
+                }
+                last_err = Some(e);
+                if attempt <= NETWORK_RETRIES {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        800 * attempt as u64,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AppError::Internal("unknown".into())))
+}
+
+async fn fetch_authorization_code_once(
+    session_key: &str,
+    org_uuid: &str,
+    scope: &str,
+    code_challenge: &str,
+    state: &str,
+    proxy_url: &str,
+) -> Result<String, AppError> {
+    let url = AUTHORIZE_API_URL.replacen("{}", org_uuid, 1);
+    let body = serde_json::json!({
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "organization_uuid": org_uuid,
+        "redirect_uri": REDIRECT_URI,
+        "scope": scope,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    });
+
+    let client = crate::tlsfp::make_request_client(proxy_url);
+    let resp = client
+        .post(&url)
+        .header("Cookie", format!("sessionKey={}", session_key))
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .header("Origin", "https://claude.ai")
+        .header("Referer", "https://claude.ai/new")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        )
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("authorize request failed: {}", e)))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "authorize failed: status {} {}",
+            status, text
+        )));
+    }
+
+    let parsed: AuthorizeApiResponse = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("authorize parse failed: {}", e)))?;
+
+    let redirect_uri = parsed.redirect_uri;
+    // 解析 query string 中的 code / state
+    let mut code: Option<String> = None;
+    let mut resp_state: Option<String> = None;
+    if let Some(q_pos) = redirect_uri.find('?') {
+        for pair in redirect_uri[q_pos + 1..].split('&') {
+            let mut iter = pair.splitn(2, '=');
+            let k = iter.next().unwrap_or("");
+            let v = iter.next().unwrap_or("");
+            match k {
+                "code" => code = Some(v.to_string()),
+                "state" => resp_state = Some(v.to_string()),
+                _ => {}
+            }
+        }
+    }
+    let code = code
+        .ok_or_else(|| AppError::Internal(format!("redirect_uri 中无 code: {}", redirect_uri)))?;
+    Ok(if let Some(s) = resp_state {
+        format!("{}#{}", code, s)
+    } else {
+        code
+    })
+}
+
+/// Step 3: POST /v1/oauth/token 交换 access_token (与 do_exchange 内部逻辑等价,
+/// 但不依赖 SessionStore)。
+async fn exchange_for_token(
+    raw_code: &str,
+    code_verifier: &str,
+    fallback_state: &str,
+    proxy_url: &str,
+    is_setup_token: bool,
+    fallback_org_uuid: &str,
+) -> Result<CookieAuthResponse, AppError> {
+    let (auth_code, code_state) = if let Some(idx) = raw_code.find('#') {
+        (&raw_code[..idx], &raw_code[idx + 1..])
+    } else {
+        (raw_code, "")
+    };
+
+    let mut body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": auth_code,
+        "redirect_uri": REDIRECT_URI,
+        "client_id": CLIENT_ID,
+        "code_verifier": code_verifier,
+    });
+    if !code_state.is_empty() {
+        body["state"] = serde_json::Value::String(code_state.to_string());
+    } else if !fallback_state.is_empty() {
+        body["state"] = serde_json::Value::String(fallback_state.to_string());
+    }
+    if is_setup_token {
+        body["expires_in"] = serde_json::json!(SETUP_TOKEN_EXPIRES_IN);
+    }
+
+    // 注意: platform.claude.com/v1/oauth/token 对 TLS 指纹敏感, 要求 Chrome 家族;
+    // craftls 是 Node.js 24.x 指纹, 该端点会回 403 "Request not allowed"。
+    // 短期解法: cc-bridge 现有 craftls Node.js 指纹只能用于 claude.ai (Step 1+2)
+    // 和 api.anthropic.com (推理), 但走不过 platform.claude.com 的 token 交换。
+    // 长期需要扩展 craftls 支持 Chrome profile。
+    let client = crate::tlsfp::make_request_client(proxy_url);
+    let resp = client
+        .post(TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/plain, */*")
+        .header("User-Agent", "axios/1.13.6")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("token exchange request failed: {}", e)))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "token exchange failed: status {} {}",
+            status, text
+        )));
+    }
+
+    let token_resp: TokenExchangeResponse = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("token exchange parse failed: {}", e)))?;
+
+    let expires_in = if token_resp.expires_in > 0 {
+        token_resp.expires_in
+    } else {
+        3600
+    };
+    let expires_at = chrono::Utc::now().timestamp() + expires_in;
+
+    let org_uuid_resp = token_resp
+        .organization
+        .as_ref()
+        .map(|o| o.uuid.clone())
+        .unwrap_or_default();
+
+    Ok(CookieAuthResponse {
+        access_token: token_resp.access_token,
+        refresh_token: token_resp.refresh_token,
+        expires_in,
+        expires_at,
+        scope: token_resp.scope,
+        account_uuid: token_resp
+            .account
+            .as_ref()
+            .map(|a| a.uuid.clone())
+            .unwrap_or_default(),
+        email_address: token_resp
+            .account
+            .as_ref()
+            .map(|a| a.email_address.clone())
+            .unwrap_or_default(),
+        organization_uuid: if org_uuid_resp.is_empty() {
+            fallback_org_uuid.to_string()
+        } else {
+            org_uuid_resp
+        },
+    })
 }

@@ -32,6 +32,12 @@ impl AccountStore {
         *guard = None;
     }
 
+    /// 数据库连通性检查 (健康端点 /readyz 用)。
+    pub async fn ping(&self) -> Result<(), AppError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// Fast path for sticky-session lookups: find an account in the cached
     /// schedulable list without hitting the DB. Returns None on cache miss
     /// or expired cache.
@@ -205,6 +211,10 @@ impl AccountStore {
             telemetry_count: row.try_get::<i64, _>("telemetry_count").unwrap_or(0),
             usage_data: Self::parse_json(row, "usage_data"),
             usage_fetched_at: Self::parse_optional_time(row, "usage_fetched_at"),
+            platform: row
+                .try_get::<String, _>("platform")
+                .unwrap_or_else(|_| "claude".to_string()),
+            extra: Self::parse_json(row, "extra"),
             created_at: Self::parse_time(row, "created_at"),
             updated_at: Self::parse_time(row, "updated_at"),
         }
@@ -232,13 +242,14 @@ impl AccountStore {
         let oauth_refreshed_at = a.oauth_refreshed_at.map(|t| self.fmt_time(t));
 
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
+        let extra_str = serde_json::to_string(&a.extra).unwrap_or_else(|_| "{}".into());
         let q = format!(
             r#"INSERT INTO accounts (name, email, status, token, proxy_url,
                 auth_type, access_token, refresh_token, oauth_expires_at, oauth_refreshed_at, auth_error,
                 device_id, canonical_env, canonical_prompt_env, canonical_process,
                 billing_mode, account_uuid, organization_uuid, subscription_type,
-                concurrency, priority, auto_telemetry)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,{},{},{},$20,$21,$22)
+                concurrency, priority, auto_telemetry, platform, extra)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,{},{},{},$20,$21,$22,$23,{})
             RETURNING {}"#,
             self.nullable_ts(9),
             self.nullable_ts(10),
@@ -249,6 +260,7 @@ impl AccountStore {
             self.nullable(17),
             self.nullable(18),
             self.nullable(19),
+            self.jsonb(24),
             self.returning_account_timestamps()
         );
         let row: AnyRow = sqlx::query(&q)
@@ -274,6 +286,8 @@ impl AccountStore {
             .bind(a.concurrency)
             .bind(a.priority)
             .bind(auto_telemetry_int)
+            .bind(&a.platform)
+            .bind(&extra_str)
             .fetch_one(&self.pool)
             .await?;
 
@@ -288,18 +302,21 @@ impl AccountStore {
         let expires_at = a.expires_at.map(|t| self.fmt_time(t));
         let oauth_refreshed_at = a.oauth_refreshed_at.map(|t| self.fmt_time(t));
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
+        let extra_str = serde_json::to_string(&a.extra).unwrap_or_else(|_| "{}".into());
         let q = format!(
             r#"UPDATE accounts SET name=$1, email=$2, status=$3, token=$4,
                 auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at={}, oauth_refreshed_at={},
                 auth_error=$10, proxy_url=$11, billing_mode=$12,
                 account_uuid={}, organization_uuid={}, subscription_type={},
-                concurrency=$16, priority=$17, auto_telemetry=$18, updated_at={}
+                concurrency=$16, priority=$17, auto_telemetry=$18,
+                platform=$20, extra={}, updated_at={}
             WHERE id=$19"#,
             self.nullable_ts(8),
             self.nullable_ts(9),
             self.nullable(13),
             self.nullable(14),
             self.nullable(15),
+            self.jsonb(21),
             self.now_expr()
         );
         sqlx::query(&q)
@@ -322,6 +339,8 @@ impl AccountStore {
             .bind(a.priority)
             .bind(auto_telemetry_int)
             .bind(a.id)
+            .bind(&a.platform)
+            .bind(&extra_str)
             .execute(&self.pool)
             .await?;
         self.invalidate_schedulable_cache().await;
@@ -574,7 +593,7 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     billing_mode, account_uuid, organization_uuid, subscription_type,
     concurrency, priority, rate_limited_at, rate_limit_reset_at,
     disable_reason, auto_telemetry, telemetry_count,
-    usage_data, usage_fetched_at, created_at, updated_at"#;
+    usage_data, usage_fetched_at, platform, extra, created_at, updated_at"#;
 
 const ACCOUNT_COLS_PG_TEXT: &str = r#"id, name, email, status, token, auth_type, access_token, refresh_token,
     oauth_expires_at::text AS oauth_expires_at, oauth_refreshed_at::text AS oauth_refreshed_at,
@@ -586,6 +605,7 @@ const ACCOUNT_COLS_PG_TEXT: &str = r#"id, name, email, status, token, auth_type,
     rate_limit_reset_at::text AS rate_limit_reset_at,
     disable_reason, auto_telemetry, telemetry_count,
     usage_data::text AS usage_data, usage_fetched_at::text AS usage_fetched_at,
+    platform, extra::text AS extra,
     created_at::text AS created_at, updated_at::text AS updated_at"#;
 
 #[cfg(test)]

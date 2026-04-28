@@ -1,0 +1,66 @@
+# cc-bridge Caddyfile 示例
+#
+# Caddy 自动 Let's Encrypt 签证书,无需手工 certbot。
+#
+# 用法:
+#   1. 把 api.example.com 改成你的真实域名 (DNS A 记录指向本机 IP)
+#   2. 复制此文件到 /etc/caddy/Caddyfile
+#   3. systemctl reload caddy
+#   4. 浏览器访问 https://api.example.com 应该看到 cc-bridge 登录页
+#
+# 装 Caddy:
+#   apt install -y debian-keyring debian-archive-keyring apt-transport-https
+#   curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+#   curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | tee /etc/apt/sources.list.d/caddy-stable.list
+#   apt update && apt install -y caddy
+
+api.example.com {
+    # 反代到本地 cc-bridge
+    reverse_proxy 127.0.0.1:5674 {
+        # SSE / 流式响应必备 (chat completions / responses 都是流式)
+        flush_interval -1
+        # 上游响应慢的请求也别提前断
+        transport http {
+            response_header_timeout 600s
+        }
+    }
+
+    # 不要把内部端点暴露给公网
+    @internal path /livez /readyz /metrics
+    handle @internal {
+        respond 404
+    }
+
+    # 启用 gzip / zstd
+    encode zstd gzip
+
+    # 安全头
+    header {
+        # 强制 HSTS
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        # 禁止内容嗅探
+        X-Content-Type-Options "nosniff"
+        # 不在 Referer 泄露完整 URL
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # 移除 Caddy 自身 Server 头
+        -Server
+    }
+
+    log {
+        output file /var/log/caddy/cc-bridge.access.log {
+            roll_size 100mb
+            roll_keep 7
+        }
+        format json
+    }
+}
+
+# ------------------------------------------------------------
+# 如果想内网另开一个 (localhost:8080) 暴露 /metrics 给 Prometheus 抓
+#
+# :8080 {
+#     bind 127.0.0.1
+#     handle /metrics {
+#         reverse_proxy 127.0.0.1:5674
+#     }
+# }

@@ -1,0 +1,234 @@
+---
+# cc-bridge Ansible playbook — 多机自动部署
+#
+# 用法:
+#   1. 装 ansible: pip install ansible (或 apt install ansible)
+#   2. 准备 inventory 文件 hosts.ini:
+#         [cc-bridge]
+#         server1 ansible_host=1.2.3.4 ansible_user=root
+#         server2 ansible_host=5.6.7.8 ansible_user=ubuntu ansible_become=yes
+#   3. 跑:
+#         GH_TOKEN=ghp_xxx ansible-playbook -i hosts.ini deploy/ansible-playbook.yml
+#
+# 升级:
+#   ansible-playbook -i hosts.ini deploy/ansible-playbook.yml --tags upgrade
+#
+# 重启:
+#   ansible-playbook -i hosts.ini deploy/ansible-playbook.yml --tags restart
+
+- name: Deploy cc-bridge
+  hosts: cc-bridge
+  become: yes
+  vars:
+    repo: "YOUR_GH_USER/cc-bridge"
+    install_dir: "/opt/cc-bridge"
+    service_user: "ccbridge"
+    service_name: "cc-bridge"
+    target_tag: "latest"        # 或具体 v1.8.5
+    gh_token: "{{ lookup('env', 'GH_TOKEN') }}"
+
+  tasks:
+    - name: 装基础依赖
+      apt:
+        name: [curl, ca-certificates, tar]
+        state: present
+        update_cache: yes
+      tags: [install]
+
+    - name: 创建系统用户
+      user:
+        name: "{{ service_user }}"
+        system: yes
+        home: "{{ install_dir }}"
+        shell: /usr/sbin/nologin
+        create_home: no
+      tags: [install]
+
+    - name: 创建目录
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ service_user }}"
+        group: "{{ service_user }}"
+        mode: "0755"
+      loop:
+        - "{{ install_dir }}"
+        - "{{ install_dir }}/data"
+        - "{{ install_dir }}/backups"
+        - "{{ install_dir }}/scripts"
+      tags: [install]
+
+    - name: 查询最新 release tag (target_tag=latest 时)
+      uri:
+        url: "https://api.github.com/repos/{{ repo }}/releases/latest"
+        return_content: yes
+        headers:
+          Authorization: "{{ 'Bearer ' + gh_token if gh_token else omit }}"
+      register: latest_release
+      when: target_tag == "latest"
+      tags: [install, upgrade]
+
+    - name: 解析实际 tag
+      set_fact:
+        actual_tag: "{{ latest_release.json.tag_name if target_tag == 'latest' else target_tag }}"
+      tags: [install, upgrade]
+
+    - name: 跳过已是最新版本
+      slurp:
+        src: "{{ install_dir }}/CURRENT_VERSION"
+      register: current_version_file
+      ignore_errors: yes
+      tags: [upgrade]
+
+    - name: 推断 binary artifact 名
+      set_fact:
+        artifact_name: >-
+          {{
+            'cc-bridge-linux-amd64' if ansible_architecture in ['x86_64','amd64']
+            else 'cc-bridge-linux-arm64' if ansible_architecture in ['aarch64','arm64']
+            else (none | mandatory)
+          }}
+      tags: [install, upgrade]
+
+    - name: 备份当前 binary + DB (升级前)
+      block:
+        - name: 创建备份目录
+          file:
+            path: "{{ install_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}"
+            state: directory
+            owner: "{{ service_user }}"
+            mode: "0755"
+        - name: 备份 binary
+          copy:
+            src: "{{ install_dir }}/cc-bridge"
+            dest: "{{ install_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}/"
+            remote_src: yes
+          ignore_errors: yes
+        - name: 备份 DB
+          copy:
+            src: "{{ install_dir }}/data/claude-code-gateway.db"
+            dest: "{{ install_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}/"
+            remote_src: yes
+          ignore_errors: yes
+      tags: [upgrade]
+
+    - name: 下载 binary tarball
+      get_url:
+        url: "https://github.com/{{ repo }}/releases/download/{{ actual_tag }}/{{ artifact_name }}.tar.gz"
+        dest: "/tmp/{{ artifact_name }}.tar.gz"
+        headers:
+          Authorization: "{{ 'Bearer ' + gh_token if gh_token else omit }}"
+        force: yes
+      tags: [install, upgrade]
+
+    - name: 解压 binary
+      unarchive:
+        src: "/tmp/{{ artifact_name }}.tar.gz"
+        dest: /tmp/
+        remote_src: yes
+      tags: [install, upgrade]
+
+    - name: 安装 binary
+      copy:
+        src: "/tmp/{{ artifact_name }}"
+        dest: "{{ install_dir }}/cc-bridge"
+        owner: "{{ service_user }}"
+        group: "{{ service_user }}"
+        mode: "0755"
+        remote_src: yes
+      notify: restart cc-bridge
+      tags: [install, upgrade]
+
+    - name: 写 CURRENT_VERSION
+      copy:
+        content: "{{ actual_tag }}"
+        dest: "{{ install_dir }}/CURRENT_VERSION"
+        owner: "{{ service_user }}"
+        mode: "0644"
+      tags: [install, upgrade]
+
+    - name: 生成默认 .env (仅首次, 含随机密码)
+      shell: |
+        if [ ! -f {{ install_dir }}/.env ]; then
+            ADMIN_PWD=$(head -c 18 /dev/urandom | base64 | tr -d '+/=' | head -c 24)
+            cat > {{ install_dir }}/.env <<EOF
+        SERVER_HOST=127.0.0.1
+        SERVER_PORT=5674
+        DATABASE_DRIVER=sqlite
+        ADMIN_PASSWORD=$ADMIN_PWD
+        LOG_LEVEL=info
+        EOF
+            chown {{ service_user }}:{{ service_user }} {{ install_dir }}/.env
+            chmod 600 {{ install_dir }}/.env
+            echo "GENERATED_PWD=$ADMIN_PWD"
+        else
+            echo "EXISTS"
+        fi
+      register: env_result
+      changed_when: "'GENERATED_PWD=' in env_result.stdout"
+      tags: [install]
+
+    - name: 显示生成的管理员密码
+      debug:
+        msg: "{{ inventory_hostname }} 管理员密码: {{ env_result.stdout | regex_search('GENERATED_PWD=(.*)', '\\1') | first }}"
+      when: "'GENERATED_PWD=' in env_result.stdout"
+      tags: [install]
+
+    - name: 同步运维脚本
+      copy:
+        src: "../scripts/{{ item }}"
+        dest: "{{ install_dir }}/scripts/{{ item }}"
+        mode: "0755"
+        owner: "{{ service_user }}"
+      loop:
+        - install.sh
+        - upgrade.sh
+        - start.sh
+        - stop.sh
+        - restart.sh
+        - status.sh
+        - uninstall.sh
+      tags: [install]
+
+    - name: 安装 systemd unit
+      copy:
+        src: "cc-bridge.service"
+        dest: "/etc/systemd/system/{{ service_name }}.service"
+        mode: "0644"
+      notify: reload systemd
+      tags: [install]
+
+    - meta: flush_handlers
+
+    - name: 启用 + 启动 service
+      systemd:
+        name: "{{ service_name }}"
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      tags: [install, upgrade, restart]
+
+    - name: 重启 service (--tags restart 时)
+      systemd:
+        name: "{{ service_name }}"
+        state: restarted
+      tags: [restart]
+
+    - name: 等待 /readyz 通过 (最多 30s)
+      uri:
+        url: "http://127.0.0.1:5674/readyz"
+        status_code: 200
+      register: ready
+      retries: 30
+      delay: 1
+      until: ready.status == 200
+      tags: [install, upgrade, restart]
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
+    - name: restart cc-bridge
+      systemd:
+        name: "{{ service_name }}"
+        state: restarted

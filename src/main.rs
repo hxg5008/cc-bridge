@@ -8,6 +8,20 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() {
+    // CLI flags: --version / -V (升级脚本检查当前版本用)
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("cc-bridge {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "cc-bridge {}\n\nUsage: claude-code-gateway [--version|--help]\n\
+             Configuration is via environment variables (see .env.example).",
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
+
     let cfg = config::Config::load();
 
     // 初始化日志
@@ -17,6 +31,9 @@ async fn main() {
                 .unwrap_or_else(|_| cfg.log_level.clone().into()),
         )
         .init();
+
+    // 标记启动时间, 供 /metrics ccbridge_uptime_seconds gauge 使用
+    service::metrics::METRICS.mark_started();
 
     // 注册 sqlx Any 驱动
     sqlx::any::install_default_drivers();
@@ -99,6 +116,7 @@ async fn main() {
     ));
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
+    let openai_oauth_svc = Arc::new(service::openai_oauth::OpenAIOAuthService::new());
 
     let app = handler::router::build_router(
         &cfg,
@@ -107,6 +125,7 @@ async fn main() {
         token_tester,
         token_store,
         oauth_flow_svc,
+        openai_oauth_svc,
         telemetry_svc,
     );
 
@@ -118,5 +137,43 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+/// 监听 SIGTERM / Ctrl-C, 触发后 axum 停止 accept 新连接,等 in-flight 请求自然结束。
+///
+/// 部署时 (docker stop / k8s rolling update / systemctl stop) 会先发 SIGTERM,
+/// 默认 grace period 10s 之后才 SIGKILL — 我们这边只要在 grace period 内把
+/// 当前响应流写完就行。
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("install Ctrl+C handler failed");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler failed")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("received Ctrl-C, draining in-flight requests");
+        },
+        _ = terminate => {
+            info!("received SIGTERM, draining in-flight requests");
+        },
+    }
 }

@@ -121,6 +121,8 @@ pub async fn refresh_oauth_token(
     let resp = client
         .post(OAUTH_TOKEN_URL)
         .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/plain, */*")
+        .header("User-Agent", "axios/1.13.6")
         .json(&body)
         .send()
         .await

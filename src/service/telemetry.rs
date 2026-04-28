@@ -895,6 +895,8 @@ mod tests {
             telemetry_count: 0,
             usage_data: json!({}),
             usage_fetched_at: None,
+            platform: "claude".into(),
+            extra: json!({}),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

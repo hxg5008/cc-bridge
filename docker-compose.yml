@@ -1,6 +1,6 @@
 services:
   cc-bridge:
-    image: ghcr.io/abkkkbb/cc-bridge:latest
+    image: ghcr.io/YOUR_GH_USER/cc-bridge:latest
     container_name: cc-bridge
     env_file:
       - .env

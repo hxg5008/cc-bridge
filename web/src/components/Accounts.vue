@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue';
-import { api, type Account, type OAuthExchangeResult, type UsageData } from '../api';
+import { api, type Account, type OAuthExchangeResult, type OpenAITokenInfo, type UsageData } from '../api';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -22,6 +22,16 @@ const currentPage = ref(1);
 const totalPages = ref(1);
 const totalCount = ref(0);
 const pageSize = 12;
+/** 平台过滤 (UI 端筛选; '' = 全部) */
+const platformFilter = ref<string>('');
+const filteredAccounts = computed(() => {
+  if (!platformFilter.value) return accounts.value;
+  return accounts.value.filter((a) =>
+    platformFilter.value === 'claude'
+      ? !a.platform || a.platform === 'claude'
+      : a.platform === platformFilter.value,
+  );
+});
 /** 表单弹窗是否可见 */
 const showForm = ref(false);
 /** 删除确认弹窗是否可见 */
@@ -30,6 +40,8 @@ const showDeleteConfirm = ref(false);
 const deleteTargetId = ref<number | null>(null);
 /** 当前编辑的账号（null 表示新建） */
 const editing = ref<Account | null>(null);
+/** 是否在编辑 OpenAI 账号 (用于分平台渲染表单字段) */
+const isOpenAIEdit = computed(() => editing.value?.platform === 'openai');
 /** 表单数据 */
 const form = ref({
   name: '',
@@ -47,6 +59,10 @@ const form = ref({
   concurrency: 5,
   priority: 50,
   auto_telemetry: false,
+  // OpenAI 专用 (走 account.extra,仅在编辑 platform=openai 账号时显示)
+  chatgpt_account_id: '',
+  organization_id: '',
+  base_url: '',
 });
 /** 正在测试的账号 ID */
 const testing = ref<number | null>(null);
@@ -123,6 +139,9 @@ function openCreate() {
     concurrency: 5,
     priority: 50,
     auto_telemetry: false,
+    chatgpt_account_id: '',
+    organization_id: '',
+    base_url: '',
   };
   showForm.value = true;
 }
@@ -133,6 +152,7 @@ function openCreate() {
  */
 function openEdit(a: Account) {
   editing.value = a;
+  const extra = (a.extra ?? {}) as Record<string, unknown>;
   form.value = {
     name: a.name,
     email: a.email,
@@ -149,6 +169,9 @@ function openEdit(a: Account) {
     concurrency: a.concurrency,
     priority: a.priority,
     auto_telemetry: a.auto_telemetry ?? false,
+    chatgpt_account_id: typeof extra.chatgpt_account_id === 'string' ? extra.chatgpt_account_id : '',
+    organization_id: typeof extra.organization_id === 'string' ? extra.organization_id : '',
+    base_url: typeof extra.base_url === 'string' ? extra.base_url : '',
   };
   showForm.value = true;
 }
@@ -159,6 +182,7 @@ async function save() {
     const expiresAt = form.value.expires_at.trim();
     const normalizedExpiresAt = normalizeExpiresAtInput(expiresAt);
     if (editing.value) {
+      const isOpenAI = editing.value.platform === 'openai';
       if (form.value.auth_type === 'setup_token'
         && !form.value.setup_token.trim()
         && editing.value.auth_type !== 'setup_token') {
@@ -178,13 +202,23 @@ async function save() {
       if (form.value.refresh_token) updates.refresh_token = form.value.refresh_token;
       if (normalizedExpiresAt) updates.expires_at = normalizedExpiresAt;
       updates.proxy_url = form.value.proxy_url;
-      updates.billing_mode = form.value.billing_mode;
-      updates.account_uuid = form.value.account_uuid || null;
-      updates.organization_uuid = form.value.organization_uuid || null;
-      updates.subscription_type = form.value.subscription_type || null;
       updates.concurrency = form.value.concurrency;
       updates.priority = form.value.priority;
-      updates.auto_telemetry = form.value.auto_telemetry;
+      if (isOpenAI) {
+        // OpenAI 账号: 把平台特有字段塞 extra,空串发后端会被当作"删除"
+        updates.extra = {
+          chatgpt_account_id: form.value.chatgpt_account_id.trim(),
+          organization_id: form.value.organization_id.trim(),
+          base_url: form.value.base_url.trim(),
+        };
+      } else {
+        // Claude 账号: billing_mode / 订阅 / Account/Org UUID / 自动遥测
+        updates.billing_mode = form.value.billing_mode;
+        updates.account_uuid = form.value.account_uuid || null;
+        updates.organization_uuid = form.value.organization_uuid || null;
+        updates.subscription_type = form.value.subscription_type || null;
+        updates.auto_telemetry = form.value.auto_telemetry;
+      }
       await api.updateAccount(editing.value.id, updates);
     } else {
       if (form.value.auth_type === 'setup_token' && !form.value.setup_token.trim()) {
@@ -454,6 +488,298 @@ const oauthLoading = ref(false);
 const oauthResult = ref<OAuthExchangeResult | null>(null);
 const oauthStep = ref<'generate' | 'exchange' | 'done'>('generate');
 
+// ===== SessionKey 一键导入 =====
+const showSkImport = ref(false);
+const skImportText = ref('');                                    // 多行文本框, 每行一个 sessionKey
+const skImportProxyUrl = ref('');                                // 美国/海外代理
+const skImportScope = ref<'full' | 'inference'>('full');         // OAuth scope
+const skImportConcurrency = ref(3);                              // 并发上限
+const skImportBillingMode = ref<'strip' | 'rewrite'>('strip');
+const skImportAutoTelemetry = ref(false);
+const skImportSubscription = ref<string>('');
+const skImportLoading = ref(false);
+const skImportStep = ref<'form' | 'result'>('form');             // 'form' = 输入, 'result' = 展示结果
+const skImportResults = ref<{ total: number; success: number; failed: number; results: any[] } | null>(null);
+const skImportLastInputs = ref<string[]>([]);                    // 最近一次提交的原始 sessionKey, 用于重试匹配
+
+/** 给定原始 sessionKey, 计算后端 mask_session_key 的脱敏值; 用来匹配 result.session_key_preview */
+function maskSk(sk: string): string {
+  if (sk.length <= 18) return '***';
+  return `${sk.slice(0, 12)}...${sk.slice(-6)}`;
+}
+
+function openSessionKeyImport() {
+  skImportText.value = '';
+  skImportProxyUrl.value = oauthProxyUrl.value || '';            // 复用上次填的代理
+  skImportScope.value = 'full';
+  skImportConcurrency.value = 3;
+  skImportBillingMode.value = 'strip';
+  skImportAutoTelemetry.value = false;
+  skImportSubscription.value = '';
+  skImportStep.value = 'form';
+  skImportResults.value = null;
+  skImportLoading.value = false;
+  showSkImport.value = true;
+}
+
+async function runSessionKeyImport() {
+  // 解析多行 sessionKey, 去空白 + 去重
+  const seen = new Set<string>();
+  const sessionKeys = skImportText.value
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((s) => {
+      if (!s || seen.has(s)) return false;
+      seen.add(s);
+      return true;
+    });
+
+  if (sessionKeys.length === 0) {
+    toast('请粘贴 sessionKey', 'error');
+    return;
+  }
+
+  await runBatchInternal(sessionKeys);
+}
+
+/** 重试失败行: 从最近一次结果里拿 FAIL 的 sessionKey 再跑一遍 */
+async function retryFailedImports() {
+  if (!skImportResults.value || skImportLastInputs.value.length === 0) return;
+  const failedPreviews = new Set(
+    skImportResults.value.results
+      .filter((r: any) => !r.success)
+      .map((r: any) => r.session_key_preview)
+  );
+  const retryKeys = skImportLastInputs.value.filter((sk) =>
+    failedPreviews.has(maskSk(sk))
+  );
+  if (retryKeys.length === 0) {
+    toast('没有可重试的失败行');
+    return;
+  }
+  await runBatchInternal(retryKeys);
+}
+
+async function runBatchInternal(sessionKeys: string[]) {
+  skImportLastInputs.value = sessionKeys;
+  skImportLoading.value = true;
+  try {
+    const resp = await api.cookieAuthCreateBatch({
+      session_keys: sessionKeys,
+      proxy_url: skImportProxyUrl.value || undefined,
+      scope: skImportScope.value,
+      concurrency_limit: skImportConcurrency.value,
+      billing_mode: skImportBillingMode.value,
+      auto_telemetry: skImportAutoTelemetry.value,
+      subscription_type: skImportSubscription.value || undefined,
+    });
+    skImportResults.value = resp;
+    skImportStep.value = 'result';
+    toast(
+      `导入完成: 成功 ${resp.success} / 失败 ${resp.failed} / 共 ${resp.total}`,
+      resp.failed === 0 ? 'success' : 'error',
+    );
+    // 刷新账号列表
+    await load();
+  } catch (e: any) {
+    toast(`导入失败: ${e.message}`, 'error');
+  } finally {
+    skImportLoading.value = false;
+  }
+}
+
+function closeSessionKeyImport() {
+  showSkImport.value = false;
+}
+
+// ===== OpenAI 账号导入 (Phase 7) =====
+const showOpenAIImport = ref(false);
+const oaMode = ref<'rt' | 'api_key' | 'codex_token' | 'oauth'>('rt');
+const oaForm = ref({
+  email: '',
+  api_key: '',
+  base_url: '',
+  organization_id: '',
+  user_agent: '',
+  proxy_url: '',
+});
+const oaRtText = ref('');                                       // RT 多行文本框
+const oaRtConcurrency = ref(3);
+const oaRtResults = ref<{ total: number; success: number; failed: number; results: any[] } | null>(null);
+const oaRtStep = ref<'form' | 'result'>('form');
+const oaOAuthStep = ref<'generate' | 'exchange' | 'done'>('generate');
+const oaSessionId = ref('');
+const oaState = ref('');
+const oaAuthUrl = ref('');
+const oaCode = ref('');
+const oaResult = ref<OpenAITokenInfo | null>(null);
+const oaLoading = ref(false);
+
+function openOpenAIImport() {
+  oaMode.value = 'rt';
+  oaForm.value = {
+    email: '',
+    api_key: '',
+    base_url: '',
+    organization_id: '',
+    user_agent: '',
+    proxy_url: '',
+  };
+  oaRtText.value = '';
+  oaRtConcurrency.value = 3;
+  oaRtResults.value = null;
+  oaRtStep.value = 'form';
+  oaOAuthStep.value = 'generate';
+  oaSessionId.value = '';
+  oaState.value = '';
+  oaAuthUrl.value = '';
+  oaCode.value = '';
+  oaResult.value = null;
+  oaLoading.value = false;
+  showOpenAIImport.value = true;
+}
+
+async function submitOpenAIRtImport() {
+  const seen = new Set<string>();
+  const tokens = oaRtText.value
+    .split('\n')
+    .map((s) => s.trim())
+    .filter((s) => {
+      if (!s || seen.has(s)) return false;
+      seen.add(s);
+      return true;
+    });
+  if (tokens.length === 0) {
+    toast('请粘贴 refresh_token', 'error');
+    return;
+  }
+  oaLoading.value = true;
+  try {
+    const r = await api.openaiRtImportBatch({
+      refresh_tokens: tokens,
+      proxy_url: oaForm.value.proxy_url || undefined,
+      user_agent: oaForm.value.user_agent || undefined,
+      base_url: oaForm.value.base_url || undefined,
+      concurrency_limit: oaRtConcurrency.value,
+    });
+    oaRtResults.value = r;
+    oaRtStep.value = 'result';
+    toast(
+      `导入: 成功 ${r.success} / 失败 ${r.failed} / 共 ${r.total}`,
+      r.failed === 0 ? 'success' : 'error',
+    );
+    await load();
+  } catch (e: any) {
+    toast(`失败: ${e.message}`, 'error');
+  } finally {
+    oaLoading.value = false;
+  }
+}
+
+async function submitOpenAIToken() {
+  if (!oaForm.value.email) {
+    toast('email 必填', 'error');
+    return;
+  }
+  if (!oaForm.value.api_key) {
+    toast('token 必填', 'error');
+    return;
+  }
+  oaLoading.value = true;
+  try {
+    await api.createOpenAIAccount({
+      email: oaForm.value.email,
+      credential_type: oaMode.value === 'codex_token' ? 'codex_token' : 'api_key',
+      api_key: oaForm.value.api_key,
+      base_url: oaForm.value.base_url || undefined,
+      organization_id: oaForm.value.organization_id || undefined,
+      user_agent: oaForm.value.user_agent || undefined,
+      proxy_url: oaForm.value.proxy_url || undefined,
+    });
+    toast('账号已添加', 'success');
+    showOpenAIImport.value = false;
+    await load();
+  } catch (e: any) {
+    toast(`失败: ${e.message}`, 'error');
+  } finally {
+    oaLoading.value = false;
+  }
+}
+
+async function generateOpenAIAuthUrl() {
+  oaLoading.value = true;
+  try {
+    const r = await api.openaiGenerateAuthUrl({
+      proxy_url: oaForm.value.proxy_url || undefined,
+    });
+    oaAuthUrl.value = r.auth_url;
+    oaSessionId.value = r.session_id;
+    oaState.value = r.state;
+    oaOAuthStep.value = 'exchange';
+    // 自动复制 + 打开浏览器
+    try {
+      await navigator.clipboard.writeText(r.auth_url);
+    } catch {}
+    window.open(r.auth_url, '_blank');
+  } catch (e: any) {
+    toast(`生成失败: ${e.message}`, 'error');
+  } finally {
+    oaLoading.value = false;
+  }
+}
+
+async function exchangeOpenAICode() {
+  if (!oaCode.value) {
+    toast('请粘贴 code', 'error');
+    return;
+  }
+  oaLoading.value = true;
+  try {
+    const r = await api.openaiExchangeCode({
+      session_id: oaSessionId.value,
+      code: oaCode.value,
+      state: oaState.value || undefined,
+    });
+    oaResult.value = r;
+    if (!oaForm.value.email && r.email) oaForm.value.email = r.email;
+    oaOAuthStep.value = 'done';
+  } catch (e: any) {
+    toast(`交换失败: ${e.message}`, 'error');
+  } finally {
+    oaLoading.value = false;
+  }
+}
+
+async function applyOpenAIOAuthAccount() {
+  if (!oaResult.value) return;
+  if (!oaForm.value.email) {
+    toast('email 必填', 'error');
+    return;
+  }
+  oaLoading.value = true;
+  try {
+    await api.createOpenAIAccount({
+      email: oaForm.value.email,
+      credential_type: 'oauth',
+      access_token: oaResult.value.access_token,
+      refresh_token: oaResult.value.refresh_token,
+      organization_id:
+        oaForm.value.organization_id || oaResult.value.organization_id || undefined,
+      chatgpt_account_id: oaResult.value.chatgpt_account_id || undefined,
+      base_url: oaForm.value.base_url || undefined,
+      user_agent: oaForm.value.user_agent || undefined,
+      proxy_url: oaForm.value.proxy_url || undefined,
+    });
+    toast('OAuth 账号已添加', 'success');
+    showOpenAIImport.value = false;
+    await load();
+  } catch (e: any) {
+    toast(`保存失败: ${e.message}`, 'error');
+  } finally {
+    oaLoading.value = false;
+  }
+}
+
 /** 打开 OAuth 授权流程弹窗 */
 function openOAuthFlow() {
   oauthMode.value = 'oauth';
@@ -527,6 +853,9 @@ function applyOAuthResult() {
     concurrency: 5,
     priority: 50,
     auto_telemetry: false,
+    chatgpt_account_id: '',
+    organization_id: '',
+    base_url: '',
   };
   showForm.value = true;
 }
@@ -574,8 +903,33 @@ async function copyText(text: string) {
   <div class="space-y-4">
     <!-- 标题栏 -->
     <div class="flex justify-between items-center">
-      <h2 class="text-lg font-semibold text-[#29261e]">账号管理</h2>
+      <div class="flex items-center gap-3">
+        <h2 class="text-lg font-semibold text-[#29261e]">账号管理</h2>
+        <select
+          v-model="platformFilter"
+          class="text-sm bg-white border border-[#e8e2d9] rounded-lg px-3 py-1.5 text-[#5c5647] hover:border-[#c4704f]/50 focus:outline-none focus:border-[#c4704f]"
+        >
+          <option value="">全部平台</option>
+          <option value="claude">Anthropic</option>
+          <option value="openai">OpenAI</option>
+          <option value="gemini">Gemini</option>
+          <option value="antigravity">Antigravity</option>
+        </select>
+        <span class="text-xs text-[#8c8475]">{{ filteredAccounts.length }} / {{ accounts.length }}</span>
+      </div>
       <div class="flex gap-2">
+        <Button
+          @click="openSessionKeyImport"
+          class="bg-[#5b8a72] hover:bg-[#4a7a62] text-white font-medium rounded-xl transition-all duration-200 hover:shadow-md"
+        >
+          SessionKey 导入
+        </Button>
+        <Button
+          @click="openOpenAIImport"
+          class="bg-[#3a6ea5] hover:bg-[#2f5d8e] text-white font-medium rounded-xl transition-all duration-200 hover:shadow-md"
+        >
+          OpenAI 导入
+        </Button>
         <Button
           @click="openOAuthFlow"
           class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl transition-all duration-200 hover:shadow-md"
@@ -594,7 +948,7 @@ async function copyText(text: string) {
     <!-- 账号卡片列表 -->
     <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
       <Card
-        v-for="a in accounts"
+        v-for="a in filteredAccounts"
         :key="a.id"
         class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 overflow-hidden"
         :class="(a.status === 'disabled' || isRateLimited(a)) ? 'opacity-60' : ''"
@@ -603,17 +957,30 @@ async function copyText(text: string) {
           <!-- 头部：名称 + 状态 -->
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-2 min-w-0">
-              <div class="w-8 h-8 rounded-lg bg-[#c4704f]/10 flex items-center justify-center flex-shrink-0">
-                <span class="text-[#c4704f] text-sm font-semibold">{{ (a.name || a.email)[0].toUpperCase() }}</span>
+              <div class="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
+                   :class="a.platform === 'openai' ? 'bg-emerald-100' : 'bg-[#c4704f]/10'">
+                <span class="text-sm font-semibold"
+                      :class="a.platform === 'openai' ? 'text-emerald-600' : 'text-[#c4704f]'">{{ (a.name || a.email)[0].toUpperCase() }}</span>
               </div>
               <div class="min-w-0">
                 <p class="text-sm font-medium text-[#29261e] truncate">{{ a.name || a.email }}</p>
                 <p v-if="a.name" class="text-xs text-[#8c8475] truncate">{{ a.email }}</p>
               </div>
             </div>
-            <Badge :class="statusStyle(a).class" class="border text-xs font-medium flex-shrink-0">
-              {{ statusStyle(a).label }}
-            </Badge>
+            <div class="flex flex-col items-end gap-1 flex-shrink-0">
+              <Badge :class="statusStyle(a).class" class="border text-xs font-medium">
+                {{ statusStyle(a).label }}
+              </Badge>
+              <span class="px-1.5 py-0.5 rounded text-[10px] font-medium"
+                    :class="a.platform === 'openai'
+                      ? 'bg-emerald-100 text-emerald-700'
+                      : 'bg-orange-100 text-orange-700'">
+                {{ a.platform === 'openai' ? 'OpenAI' : 'Anthropic' }}
+                <span class="opacity-70">· {{ a.auth_type === 'oauth' ? 'OAuth' : 'Token' }}</span>
+                <span v-if="a.platform === 'openai' && a.extra && (a.extra as any).plan_type"
+                      class="ml-1 opacity-70">{{ (a.extra as any).plan_type }}</span>
+              </span>
+            </div>
           </div>
 
           <!-- 信息 -->
@@ -643,7 +1010,7 @@ async function copyText(text: string) {
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">认证方式</p>
                 <p class="text-sm text-[#8c8475] truncate">{{ authTypeLabel(a.auth_type) }}</p>
               </div>
-              <div>
+              <div v-if="(!a.platform || a.platform === 'claude')">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">自动遥测</p>
                 <p class="text-sm" :class="a.auto_telemetry ? 'text-emerald-600' : 'text-[#8c8475]'">
                   {{ a.auto_telemetry ? '已开启' : '关闭' }}
@@ -667,29 +1034,43 @@ async function copyText(text: string) {
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">认证错误</p>
                 <p class="text-xs text-red-500 line-clamp-2">{{ a.auth_error }}</p>
               </div>
-              <div>
+              <div v-if="(!a.platform || a.platform === 'claude')">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">环境指纹</p>
                 <p class="text-xs text-[#8c8475] truncate">
                   {{ a.canonical_env?.platform || '—' }} / {{ a.canonical_env?.arch || '—' }} · v{{ a.canonical_env?.version || '—' }}
                 </p>
               </div>
-              <div>
+              <div v-if="(!a.platform || a.platform === 'claude')">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">提示词环境</p>
                 <p class="text-xs text-[#8c8475] truncate">
                   {{ a.canonical_prompt_env?.platform || '—' }} · {{ a.canonical_prompt_env?.shell || '—' }} · {{ a.canonical_prompt_env?.working_dir || '—' }}
                 </p>
               </div>
-              <div>
+              <div v-if="(!a.platform || a.platform === 'claude')">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">进程指纹</p>
                 <p class="text-xs text-[#8c8475] truncate">
                   内存 {{ formatBytes(a.canonical_process?.constrained_memory) }} · RSS {{ formatBytes(a.canonical_process?.rss_range?.[0]) }}–{{ formatBytes(a.canonical_process?.rss_range?.[1]) }}
                 </p>
               </div>
+
+              <!-- OpenAI 专属信息 -->
+              <div v-if="a.platform === 'openai' && a.extra && (a.extra as any).chatgpt_account_id">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">ChatGPT Account</p>
+                <p class="font-mono text-[11px] text-[#8c8475] truncate">{{ (a.extra as any).chatgpt_account_id }}</p>
+              </div>
+              <div v-if="a.platform === 'openai' && a.extra && (a.extra as any).organization_id">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">Organization</p>
+                <p class="font-mono text-[11px] text-[#8c8475] truncate">{{ (a.extra as any).organization_id }}</p>
+              </div>
+              <div v-if="a.platform === 'openai' && a.extra && (a.extra as any).base_url">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">Base URL</p>
+                <p class="text-xs text-[#8c8475] truncate">{{ (a.extra as any).base_url }}</p>
+              </div>
             </div>
           </div>
 
-          <!-- 用量窗口 -->
-          <div class="pt-2 border-t border-[#f0ebe4] space-y-2">
+          <!-- 用量窗口 (仅 Claude) -->
+          <div v-if="(!a.platform || a.platform === 'claude')" class="pt-2 border-t border-[#f0ebe4] space-y-2">
             <div class="flex items-center justify-between">
               <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">用量</p>
               <p v-if="a.usage_fetched_at" class="text-[10px] text-[#b5b0a6]">
@@ -820,6 +1201,7 @@ async function copyText(text: string) {
               编辑
             </Button>
             <Button
+              v-if="(!a.platform || a.platform === 'claude')"
               variant="ghost"
               size="sm"
               @click="refreshUsage(a.id)"
@@ -851,7 +1233,7 @@ async function copyText(text: string) {
 
       <!-- 空状态 -->
       <div
-        v-if="accounts.length === 0"
+        v-if="filteredAccounts.length === 0"
         class="col-span-full flex flex-col items-center justify-center py-16 text-[#b5b0a6]"
       >
         <div class="w-12 h-12 rounded-xl bg-[#f0ebe4] flex items-center justify-center mb-3">
@@ -1010,6 +1392,59 @@ async function copyText(text: string) {
               class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
             />
           </div>
+
+          <!-- OpenAI 账号专用 -->
+          <template v-if="isOpenAIEdit">
+            <div class="rounded-lg bg-[#f9f6f1] px-3 py-2 text-xs text-[#8c8475]">
+              已识别为 OpenAI 账号,以下字段写入 <code class="text-[#c4704f]">extra</code>。
+              UA / Originator / instructions 由网关强制覆盖,无需手填。
+            </div>
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">ChatGPT Account ID（OAuth 账号必填）</Label>
+              <Input
+                v-model="form.chatgpt_account_id"
+                placeholder="走 chatgpt.com 时发 chatgpt-account-id 头"
+                class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20 font-mono text-sm"
+              />
+            </div>
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">Organization ID（选填）</Label>
+              <Input
+                v-model="form.organization_id"
+                placeholder="API Key 模式发 OpenAI-Organization 头"
+                class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20 font-mono text-sm"
+              />
+            </div>
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">Base URL（选填,仅 API Key 模式生效）</Label>
+              <Input
+                v-model="form.base_url"
+                placeholder="https://api.openai.com (默认)"
+                class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20 font-mono text-sm"
+              />
+            </div>
+            <div
+              v-if="editing && editing.extra && (
+                (editing.extra as any).plan_type
+                  || (editing.extra as any).privacy_mode
+                  || (editing.extra as any).subscription_expires_at
+              )"
+              class="rounded-lg bg-[#f9f6f1] px-3 py-2 text-xs text-[#8c8475] space-y-0.5"
+            >
+              <div v-if="(editing.extra as any).plan_type">
+                订阅: <span class="text-[#29261e] font-medium">{{ (editing.extra as any).plan_type }}</span>
+                <span v-if="(editing.extra as any).subscription_expires_at" class="ml-2">
+                  到期: {{ (editing.extra as any).subscription_expires_at }}
+                </span>
+              </div>
+              <div v-if="(editing.extra as any).privacy_mode">
+                隐私: <span class="text-[#29261e]">{{ (editing.extra as any).privacy_mode }}</span>
+              </div>
+            </div>
+          </template>
+
+          <!-- Claude 账号专用 (Billing / 订阅类型 / Account/Org UUID / 自动遥测) -->
+          <template v-else>
           <div class="space-y-2">
             <Label class="text-[#5c5647] text-sm">Billing 模式</Label>
             <div class="flex gap-2">
@@ -1103,6 +1538,7 @@ async function copyText(text: string) {
             </div>
             <p class="text-xs text-[#b5b0a6]">开启后由网关代替客户端发送遥测请求</p>
           </div>
+          </template>
           <div class="flex gap-4">
             <div class="flex-1 space-y-2">
               <Label class="text-[#5c5647] text-sm">并发数</Label>
@@ -1365,6 +1801,450 @@ async function copyText(text: string) {
             </div>
           </template>
         </div>
+      </DialogContent>
+    </Dialog>
+
+    <!-- SessionKey 一键导入弹窗 -->
+    <Dialog v-model:open="showSkImport">
+      <DialogContent class="bg-white border-[#e8e2d9] rounded-2xl text-[#29261e] sm:max-w-2xl max-h-[85vh] flex flex-col">
+        <DialogHeader class="flex-shrink-0">
+          <DialogTitle class="text-[#29261e] text-lg">SessionKey 一键导入</DialogTitle>
+          <DialogDescription class="text-[#8c8475]">
+            粘贴 claude.ai 的 sessionKey (sk-ant-sid02-...), 自动跑 OAuth 流程并入库账号。支持单个或多个 (一行一个)。
+          </DialogDescription>
+        </DialogHeader>
+
+        <div class="space-y-4 mt-2 overflow-y-auto flex-1 pr-1">
+          <!-- 表单步骤 -->
+          <template v-if="skImportStep === 'form'">
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">sessionKey 列表 <span class="text-red-500">*</span></Label>
+              <Textarea
+                v-model="skImportText"
+                rows="6"
+                placeholder="sk-ant-sid02-xxxxxxxx&#10;sk-ant-sid02-yyyyyyyy&#10;sk-ant-sid02-zzzzzzzz"
+                class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] font-mono text-xs"
+              />
+              <p class="text-xs text-[#8c8475]">每行一个 sessionKey, 自动去重</p>
+            </div>
+
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">代理 (海外代理, platform.claude.com 必须走代理)</Label>
+              <Input
+                v-model="skImportProxyUrl"
+                placeholder="http://user:pass@host:port 或 socks5://..."
+                class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e]"
+              />
+            </div>
+
+            <div class="grid grid-cols-2 gap-3">
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">授权类型</Label>
+                <div class="flex gap-2">
+                  <button
+                    type="button"
+                    @click="skImportScope = 'full'"
+                    class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                    :class="skImportScope === 'full' ? 'bg-amber-50 border-amber-400 text-amber-600' : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+                  >
+                    Full OAuth
+                  </button>
+                  <button
+                    type="button"
+                    @click="skImportScope = 'inference'"
+                    class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                    :class="skImportScope === 'inference' ? 'bg-amber-50 border-amber-400 text-amber-600' : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+                  >
+                    Setup Token
+                  </button>
+                </div>
+              </div>
+
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">并发上限</Label>
+                <Input
+                  v-model.number="skImportConcurrency"
+                  type="number"
+                  min="1"
+                  max="30"
+                  class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e]"
+                />
+                <p class="text-xs text-[#8c8475]">推荐 3-5, 太高会触发风控</p>
+              </div>
+            </div>
+
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">Billing 模式</Label>
+              <div class="flex gap-2">
+                <button
+                  type="button"
+                  @click="skImportBillingMode = 'strip'"
+                  class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                  :class="skImportBillingMode === 'strip' ? 'bg-amber-50 border-amber-400 text-amber-600' : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+                >
+                  清除 (Strip)
+                </button>
+                <button
+                  type="button"
+                  @click="skImportBillingMode = 'rewrite'"
+                  class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                  :class="skImportBillingMode === 'rewrite' ? 'bg-amber-50 border-amber-400 text-amber-600' : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+                >
+                  重写 (Rewrite)
+                </button>
+              </div>
+            </div>
+
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">订阅类型 (可选)</Label>
+              <div class="flex gap-2 flex-wrap">
+                <button
+                  v-for="opt in [{value:'',label:'未设置'},{value:'max',label:'Max'},{value:'pro',label:'Pro'},{value:'team',label:'Team'},{value:'enterprise',label:'Enterprise'}]"
+                  :key="opt.value"
+                  type="button"
+                  @click="skImportSubscription = opt.value"
+                  class="px-3 py-1.5 rounded-lg text-sm font-medium border transition-all duration-200"
+                  :class="skImportSubscription === opt.value ? 'bg-amber-50 border-amber-400 text-amber-600' : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+
+            <div class="flex items-center gap-2">
+              <input
+                id="sk-auto-tel"
+                type="checkbox"
+                v-model="skImportAutoTelemetry"
+                class="rounded border-[#e8e2d9]"
+              />
+              <Label for="sk-auto-tel" class="text-[#5c5647] text-sm cursor-pointer">
+                启用自动遥测 (auto_telemetry)
+              </Label>
+            </div>
+          </template>
+
+          <!-- 结果步骤 -->
+          <template v-else-if="skImportStep === 'result' && skImportResults">
+            <div class="grid grid-cols-3 gap-3">
+              <div class="bg-blue-50 border border-blue-200 rounded-xl p-3">
+                <p class="text-xs text-[#8c8475]">总数</p>
+                <p class="text-2xl font-semibold text-blue-700">{{ skImportResults.total }}</p>
+              </div>
+              <div class="bg-green-50 border border-green-200 rounded-xl p-3">
+                <p class="text-xs text-[#8c8475]">成功</p>
+                <p class="text-2xl font-semibold text-green-700">{{ skImportResults.success }}</p>
+              </div>
+              <div class="bg-red-50 border border-red-200 rounded-xl p-3">
+                <p class="text-xs text-[#8c8475]">失败</p>
+                <p class="text-2xl font-semibold text-red-700">{{ skImportResults.failed }}</p>
+              </div>
+            </div>
+
+            <div class="space-y-2 max-h-96 overflow-y-auto">
+              <div
+                v-for="(r, idx) in skImportResults.results"
+                :key="idx"
+                class="border rounded-lg p-3 text-xs"
+                :class="r.success ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'"
+              >
+                <div class="flex items-center gap-2 mb-1">
+                  <Badge :class="r.success ? 'bg-green-600 text-white' : 'bg-red-600 text-white'">
+                    {{ r.success ? 'OK' : 'FAIL' }}
+                  </Badge>
+                  <span class="font-mono text-[#5c5647]">{{ r.session_key_preview }}</span>
+                </div>
+                <div v-if="r.success" class="text-[#5c5647]">
+                  ID: <span class="font-mono">{{ r.account_id }}</span>
+                  &nbsp;|&nbsp; Email: <span class="font-mono">{{ r.email }}</span>
+                </div>
+                <div v-else class="text-red-700 break-all">
+                  {{ r.error }}
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <DialogFooter class="gap-2 pt-2 flex-shrink-0">
+          <template v-if="skImportStep === 'form'">
+            <Button
+              variant="ghost"
+              @click="closeSessionKeyImport"
+              :disabled="skImportLoading"
+              class="text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]"
+            >
+              取消
+            </Button>
+            <Button
+              @click="runSessionKeyImport"
+              :disabled="skImportLoading"
+              class="bg-[#5b8a72] hover:bg-[#4a7a62] text-white font-medium rounded-xl transition-all duration-200"
+            >
+              {{ skImportLoading ? '导入中…' : '开始导入' }}
+            </Button>
+          </template>
+          <template v-else>
+            <Button
+              v-if="skImportResults && skImportResults.failed > 0"
+              @click="retryFailedImports"
+              :disabled="skImportLoading"
+              class="bg-amber-500 hover:bg-amber-600 text-white font-medium rounded-xl"
+            >
+              {{ skImportLoading ? '重试中…' : `重试失败行 (${skImportResults.failed})` }}
+            </Button>
+            <Button
+              variant="ghost"
+              @click="skImportStep = 'form'"
+              :disabled="skImportLoading"
+              class="text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]"
+            >
+              返回
+            </Button>
+            <Button
+              @click="closeSessionKeyImport"
+              :disabled="skImportLoading"
+              class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl"
+            >
+              关闭
+            </Button>
+          </template>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <!-- OpenAI 账号导入弹窗 (Phase 7) -->
+    <Dialog v-model:open="showOpenAIImport">
+      <DialogContent class="bg-white border-[#e8e2d9] rounded-2xl text-[#29261e] sm:max-w-2xl max-h-[85vh] flex flex-col">
+        <DialogHeader class="flex-shrink-0">
+          <DialogTitle class="text-[#29261e] text-lg">OpenAI 账号导入</DialogTitle>
+          <DialogDescription class="text-[#8c8475]">
+            4 种授权: Refresh Token 批量 / API Key / Codex Token / ChatGPT OAuth 浏览器流程
+          </DialogDescription>
+        </DialogHeader>
+
+        <div class="space-y-4 mt-2 overflow-y-auto flex-1 pr-1">
+          <!-- 模式切换 -->
+          <div class="grid grid-cols-4 gap-2">
+            <button
+              type="button"
+              @click="oaMode = 'rt'"
+              class="px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+              :class="oaMode === 'rt' ? 'bg-blue-50 border-blue-400 text-blue-600' : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-blue-300'"
+            >
+              Refresh Token
+            </button>
+            <button
+              type="button"
+              @click="oaMode = 'api_key'"
+              class="px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+              :class="oaMode === 'api_key' ? 'bg-blue-50 border-blue-400 text-blue-600' : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-blue-300'"
+            >
+              API Key
+            </button>
+            <button
+              type="button"
+              @click="oaMode = 'codex_token'"
+              class="px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+              :class="oaMode === 'codex_token' ? 'bg-blue-50 border-blue-400 text-blue-600' : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-blue-300'"
+            >
+              Codex Token
+            </button>
+            <button
+              type="button"
+              @click="oaMode = 'oauth'"
+              class="px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+              :class="oaMode === 'oauth' ? 'bg-blue-50 border-blue-400 text-blue-600' : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-blue-300'"
+            >
+              手动授权
+            </button>
+          </div>
+
+          <!-- Refresh Token 批量导入 -->
+          <template v-if="oaMode === 'rt'">
+            <template v-if="oaRtStep === 'form'">
+              <p class="text-sm text-[#5c5647]">
+                输入您已有的 OpenAI Refresh Token, 系统将自动验证并创建账号。支持批量(每行一个)。
+              </p>
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">Refresh Token 列表 <span class="text-red-500">*</span></Label>
+                <Textarea v-model="oaRtText" rows="6" placeholder="粘贴您的 OpenAI Refresh Token...&#10;支持多个, 每行一个"
+                          class="bg-[#f9f6f1] border-[#e8e2d9] font-mono text-xs" />
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="space-y-2">
+                  <Label class="text-[#5c5647] text-sm">代理 (海外 OpenAI 必走)</Label>
+                  <Input v-model="oaForm.proxy_url" placeholder="http://user:pass@host:port"
+                         class="bg-[#f9f6f1] border-[#e8e2d9]" />
+                </div>
+                <div class="space-y-2">
+                  <Label class="text-[#5c5647] text-sm">并发上限</Label>
+                  <Input v-model.number="oaRtConcurrency" type="number" min="1" max="10"
+                         class="bg-[#f9f6f1] border-[#e8e2d9]" />
+                </div>
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="space-y-2">
+                  <Label class="text-[#5c5647] text-sm">User-Agent (可选)</Label>
+                  <Input v-model="oaForm.user_agent" placeholder="codex_cli_rs/0.104.0"
+                         class="bg-[#f9f6f1] border-[#e8e2d9]" />
+                </div>
+                <div class="space-y-2">
+                  <Label class="text-[#5c5647] text-sm">Base URL (可选)</Label>
+                  <Input v-model="oaForm.base_url" placeholder="https://api.openai.com"
+                         class="bg-[#f9f6f1] border-[#e8e2d9]" />
+                </div>
+              </div>
+            </template>
+
+            <template v-else-if="oaRtResults">
+              <div class="grid grid-cols-3 gap-3">
+                <div class="bg-blue-50 border border-blue-200 rounded-xl p-3">
+                  <p class="text-xs text-[#8c8475]">总数</p>
+                  <p class="text-2xl font-semibold text-blue-700">{{ oaRtResults.total }}</p>
+                </div>
+                <div class="bg-green-50 border border-green-200 rounded-xl p-3">
+                  <p class="text-xs text-[#8c8475]">成功</p>
+                  <p class="text-2xl font-semibold text-green-700">{{ oaRtResults.success }}</p>
+                </div>
+                <div class="bg-red-50 border border-red-200 rounded-xl p-3">
+                  <p class="text-xs text-[#8c8475]">失败</p>
+                  <p class="text-2xl font-semibold text-red-700">{{ oaRtResults.failed }}</p>
+                </div>
+              </div>
+              <div class="space-y-2 max-h-72 overflow-y-auto">
+                <div v-for="(r, idx) in oaRtResults.results" :key="idx"
+                     class="border rounded-lg p-3 text-xs"
+                     :class="r.success ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'">
+                  <div class="flex items-center gap-2 mb-1">
+                    <Badge :class="r.success ? 'bg-green-600 text-white' : 'bg-red-600 text-white'">
+                      {{ r.success ? 'OK' : 'FAIL' }}
+                    </Badge>
+                    <span class="font-mono">{{ r.rt_preview }}</span>
+                  </div>
+                  <div v-if="r.success" class="text-[#5c5647]">
+                    ID: <span class="font-mono">{{ r.account_id }}</span> | Email: {{ r.email }}
+                  </div>
+                  <div v-else class="text-red-700 break-all">{{ r.error }}</div>
+                </div>
+              </div>
+            </template>
+          </template>
+
+          <!-- API Key / Codex Token 共用表单 -->
+          <template v-else-if="oaMode === 'api_key' || oaMode === 'codex_token'">
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">Email <span class="text-red-500">*</span></Label>
+              <Input v-model="oaForm.email" placeholder="my-openai@example.com" class="bg-[#f9f6f1] border-[#e8e2d9]" />
+            </div>
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">{{ oaMode === 'api_key' ? 'API Key (sk-* / sk-proj-*)' : 'Codex Token' }} <span class="text-red-500">*</span></Label>
+              <Input v-model="oaForm.api_key" placeholder="sk-..." type="password" class="bg-[#f9f6f1] border-[#e8e2d9] font-mono text-xs" />
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">Organization ID (可选)</Label>
+                <Input v-model="oaForm.organization_id" placeholder="org-xxxx" class="bg-[#f9f6f1] border-[#e8e2d9]" />
+              </div>
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">Base URL (可选)</Label>
+                <Input v-model="oaForm.base_url" placeholder="https://api.openai.com" class="bg-[#f9f6f1] border-[#e8e2d9]" />
+              </div>
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">User-Agent (可选)</Label>
+                <Input v-model="oaForm.user_agent" placeholder="codex_cli_rs/0.104.0" class="bg-[#f9f6f1] border-[#e8e2d9]" />
+              </div>
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">代理 (可选)</Label>
+                <Input v-model="oaForm.proxy_url" placeholder="http://user:pass@host:port" class="bg-[#f9f6f1] border-[#e8e2d9]" />
+              </div>
+            </div>
+          </template>
+
+          <!-- ChatGPT OAuth 浏览器流程 -->
+          <template v-else>
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">代理 (可选, OpenAI auth.openai.com 国内通常需代理)</Label>
+              <Input v-model="oaForm.proxy_url" placeholder="http://user:pass@host:port" class="bg-[#f9f6f1] border-[#e8e2d9]" />
+            </div>
+
+            <template v-if="oaOAuthStep === 'generate'">
+              <p class="text-sm text-[#5c5647]">点【生成授权链接】将打开浏览器登录 chatgpt.com, 完成后从地址栏复制 code 回粘到下一步。</p>
+            </template>
+
+            <template v-else-if="oaOAuthStep === 'exchange'">
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">授权链接 (已自动复制 + 打开浏览器)</Label>
+                <Input v-model="oaAuthUrl" readonly class="bg-[#f9f6f1] border-[#e8e2d9] text-xs" />
+              </div>
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">授权码 code <span class="text-red-500">*</span></Label>
+                <Input v-model="oaCode" placeholder="从浏览器回调地址中复制 code 参数" class="bg-[#f9f6f1] border-[#e8e2d9] font-mono text-xs" />
+              </div>
+            </template>
+
+            <template v-else-if="oaOAuthStep === 'done' && oaResult">
+              <div class="bg-green-50 border border-green-200 rounded-xl p-3 space-y-1 text-sm">
+                <p><strong>Email:</strong> {{ oaResult.email }}</p>
+                <p><strong>Plan:</strong> {{ oaResult.plan_type || '(空)' }}</p>
+                <p><strong>Org ID:</strong> <span class="font-mono text-xs">{{ oaResult.organization_id || '(空)' }}</span></p>
+                <p><strong>ChatGPT Account ID:</strong> <span class="font-mono text-xs">{{ oaResult.chatgpt_account_id || '(空)' }}</span></p>
+                <p><strong>Expires in:</strong> {{ oaResult.expires_in }}s</p>
+              </div>
+              <div class="space-y-2">
+                <Label class="text-[#5c5647] text-sm">Email (用于账号唯一标识)</Label>
+                <Input v-model="oaForm.email" placeholder="my-openai@example.com" class="bg-[#f9f6f1] border-[#e8e2d9]" />
+              </div>
+            </template>
+          </template>
+        </div>
+
+        <DialogFooter class="gap-2 pt-2 flex-shrink-0">
+          <template v-if="oaMode === 'rt'">
+            <template v-if="oaRtStep === 'form'">
+              <Button variant="ghost" @click="showOpenAIImport = false" :disabled="oaLoading"
+                      class="text-[#8c8475] hover:bg-[#f0ebe4]">取消</Button>
+              <Button @click="submitOpenAIRtImport" :disabled="oaLoading"
+                      class="bg-[#3a6ea5] hover:bg-[#2f5d8e] text-white font-medium rounded-xl">
+                {{ oaLoading ? '验证中…' : '验证并创建账号' }}
+              </Button>
+            </template>
+            <template v-else>
+              <Button variant="ghost" @click="oaRtStep = 'form'" :disabled="oaLoading"
+                      class="text-[#8c8475] hover:bg-[#f0ebe4]">返回</Button>
+              <Button @click="showOpenAIImport = false" :disabled="oaLoading"
+                      class="bg-[#3a6ea5] hover:bg-[#2f5d8e] text-white font-medium rounded-xl">
+                关闭
+              </Button>
+            </template>
+          </template>
+          <template v-else-if="oaMode === 'api_key' || oaMode === 'codex_token'">
+            <Button variant="ghost" @click="showOpenAIImport = false" :disabled="oaLoading"
+                    class="text-[#8c8475] hover:bg-[#f0ebe4]">取消</Button>
+            <Button @click="submitOpenAIToken" :disabled="oaLoading"
+                    class="bg-[#3a6ea5] hover:bg-[#2f5d8e] text-white font-medium rounded-xl">
+              {{ oaLoading ? '保存中…' : '保存账号' }}
+            </Button>
+          </template>
+          <template v-else>
+            <Button variant="ghost" @click="showOpenAIImport = false" :disabled="oaLoading"
+                    class="text-[#8c8475] hover:bg-[#f0ebe4]">取消</Button>
+            <Button v-if="oaOAuthStep === 'generate'" @click="generateOpenAIAuthUrl" :disabled="oaLoading"
+                    class="bg-[#3a6ea5] hover:bg-[#2f5d8e] text-white font-medium rounded-xl">
+              {{ oaLoading ? '生成中…' : '生成授权链接' }}
+            </Button>
+            <Button v-else-if="oaOAuthStep === 'exchange'" @click="exchangeOpenAICode" :disabled="oaLoading"
+                    class="bg-[#3a6ea5] hover:bg-[#2f5d8e] text-white font-medium rounded-xl">
+              {{ oaLoading ? '交换中…' : '交换 Token' }}
+            </Button>
+            <Button v-else @click="applyOpenAIOAuthAccount" :disabled="oaLoading"
+                    class="bg-[#3a6ea5] hover:bg-[#2f5d8e] text-white font-medium rounded-xl">
+              {{ oaLoading ? '保存中…' : '保存账号' }}
+            </Button>
+          </template>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   </div>

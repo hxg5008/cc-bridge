@@ -108,6 +108,11 @@ impl AccountService {
         self.store.delete(id).await
     }
 
+    /// 数据库连通性检查 (健康端点 /readyz 用)。
+    pub async fn ping_db(&self) -> Result<(), AppError> {
+        self.store.ping().await
+    }
+
     pub async fn get_account(&self, id: i64) -> Result<Account, AppError> {
         self.store.get_by_id(id).await
     }
@@ -170,10 +175,15 @@ impl AccountService {
         let accounts = self.store.list_schedulable().await?;
         let total_schedulable = accounts.len();
 
-        // 过滤：排除项 + 可用账号限制 + 限流状态（内存热态）
-        // Sonnet 请求旁路：走 Sonnet 专属 ban 检查而非全量 availability，
-        // 让 5h/7d 高利用率 / RPM·TPM 预抢等本地软限流不挡 Sonnet，同时仍能避开刚撞到 Sonnet 429 的账号。
+        // 平台过滤: Claude 网关 (/v1/messages 等) 只调度 platform=claude 的账号
+        // OpenAI 账号有独立的 /v1/chat/completions handler 处理, 不能混入 Claude 路径,
+        // 否则会用 Anthropic 的 refresh endpoint 去刷 OpenAI RT, 拿到 403。
+        // 兼容旧数据: platform 为空字符串视为 claude (DB DEFAULT 是 'claude')
         let mut limited_out: Vec<i64> = Vec::new();
+        let accounts: Vec<Account> = accounts
+            .into_iter()
+            .filter(|a| a.platform.is_empty() || a.platform == "claude")
+            .collect();
         let candidates: Vec<Account> = accounts
             .into_iter()
             .filter(|a| {
@@ -216,6 +226,95 @@ impl AccountService {
         let selected = select_by_priority(&candidates);
 
         // 绑定粘性会话
+        if !session_hash.is_empty() {
+            let _ = self
+                .cache
+                .set_session_account_id(session_hash, selected.id, STICKY_SESSION_TTL)
+                .await;
+        }
+
+        Ok(selected)
+    }
+
+    /// 选择一个 OpenAI 账号 (platform=="openai")。
+    ///
+    /// 镜像 [`Self::select_account`] 的粘性会话 + 优先级 + 黑白名单逻辑,但:
+    ///   - 平台过滤改为 `platform == "openai"`
+    ///   - cache key 已经由调用方通过 [`crate::service::codex_session::sticky_session_cache_key`]
+    ///     加上 `openai:` 前缀,与 Claude 粘性会话隔离
+    ///   - 不走 `LimitStore` (OpenAI 用量目前是异步落到 `account.extra` 的, 后续 PR 再联动调度)
+    pub async fn select_openai_account(
+        &self,
+        session_hash: &str,
+        exclude_ids: &[i64],
+        allowed_ids: &[i64],
+    ) -> Result<Account, AppError> {
+        use crate::service::openai_limit::openai_schedulable;
+
+        // 1) 命中粘性会话
+        if !session_hash.is_empty() {
+            if let Ok(Some(account_id)) = self.cache.get_session_account_id(session_hash).await {
+                if account_id > 0 {
+                    if let Ok(account) = self.store.get_by_id(account_id).await {
+                        let id_allowed =
+                            allowed_ids.is_empty() || allowed_ids.contains(&account_id);
+                        if account.platform == "openai"
+                            && account.is_schedulable()
+                            && !exclude_ids.contains(&account_id)
+                            && id_allowed
+                            && openai_schedulable(&account)
+                        {
+                            return Ok(account);
+                        }
+                    }
+                    // 过期 / 不再可调度 → 删除粘性绑定
+                    let _ = self.cache.delete_session(session_hash).await;
+                }
+            }
+        }
+
+        // 2) 列出全部可调度账号, 过滤平台 + 用量/429
+        let accounts = self.store.list_schedulable().await?;
+        let total = accounts.len();
+        let mut limited_out: Vec<i64> = Vec::new();
+        let candidates: Vec<Account> = accounts
+            .into_iter()
+            .filter(|a| a.platform == "openai")
+            .filter(|a| {
+                if exclude_ids.contains(&a.id) {
+                    return false;
+                }
+                if !(allowed_ids.is_empty() || allowed_ids.contains(&a.id)) {
+                    return false;
+                }
+                if !openai_schedulable(a) {
+                    limited_out.push(a.id);
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        if !limited_out.is_empty() {
+            crate::service::metrics::METRICS
+                .record_filtered_by_limit(limited_out.len() as u64);
+            info!(
+                "select_openai: {} of {} schedulable accounts filtered by codex usage / 429: {:?}",
+                limited_out.len(),
+                total,
+                limited_out
+            );
+        }
+
+        if candidates.is_empty() {
+            return Err(AppError::ServiceUnavailable(
+                "no available openai accounts".into(),
+            ));
+        }
+
+        let selected = select_by_priority(&candidates);
+
+        // 3) 写回粘性绑定
         if !session_hash.is_empty() {
             let _ = self
                 .cache
@@ -419,9 +518,13 @@ impl AccountService {
                         tokens.expires_at,
                     )
                     .await?;
+                crate::service::metrics::METRICS
+                    .record_oauth_refresh(crate::service::metrics::Platform::Claude, true);
                 Ok(tokens.access_token)
             }
             Err(err) => {
+                crate::service::metrics::METRICS
+                    .record_oauth_refresh(crate::service::metrics::Platform::Claude, false);
                 let msg = err.to_string();
                 let _ = self.store.update_auth_error(id, &msg).await;
                 if fallback_is_still_valid && !fallback_access_token.is_empty() {
@@ -461,6 +564,133 @@ impl AccountService {
 
     pub async fn enable_account(&self, id: i64) -> Result<(), AppError> {
         self.store.enable_account(id).await
+    }
+
+    /// 获取 OpenAI OAuth 账号最新 access_token,带全局刷新锁防 thundering herd。
+    ///
+    /// 与 [`Self::resolve_oauth_access_token`] 同样的 lock + 等待 pattern, 区别:
+    /// - 调用 `OpenAIOAuthService::refresh_token` (而非 Claude oauth)
+    /// - 不存在 SetupToken 路径 (调用方自己判断 auth_type)
+    /// - 持久化时同时更新 extra (refresh 可能拿到新的 chatgpt_account_id 等)
+    ///
+    /// 返回刷新后的 Account (含最新 access_token / refresh_token / expires_at)。
+    pub async fn resolve_openai_access_token(
+        &self,
+        account: &Account,
+        openai_oauth: &crate::service::openai_oauth::OpenAIOAuthService,
+    ) -> Result<Account, AppError> {
+        if account.has_valid_oauth_access_token(OAUTH_REFRESH_BUFFER_SECONDS) {
+            return Ok(account.clone());
+        }
+        if account.refresh_token.is_empty() {
+            return Err(AppError::ServiceUnavailable(
+                "openai refresh token is empty".into(),
+            ));
+        }
+
+        let lock_key = format!("oauth:refresh:account:{}", account.id);
+        let lock_owner = Uuid::new_v4().to_string();
+        let acquired = self
+            .cache
+            .acquire_lock(&lock_key, &lock_owner, OAUTH_LOCK_TTL)
+            .await?;
+
+        if acquired {
+            let result = self
+                .do_openai_refresh(account.id, openai_oauth)
+                .await;
+            self.cache.release_lock(&lock_key, &lock_owner).await;
+            return result;
+        }
+
+        for _ in 0..OAUTH_WAIT_ATTEMPTS {
+            sleep(OAUTH_WAIT_RETRY).await;
+            let latest = self.store.get_by_id(account.id).await?;
+            if latest.has_valid_oauth_access_token(OAUTH_REFRESH_BUFFER_SECONDS) {
+                return Ok(latest);
+            }
+        }
+        Err(AppError::ServiceUnavailable(
+            "openai oauth token refresh timeout".into(),
+        ))
+    }
+
+    async fn do_openai_refresh(
+        &self,
+        id: i64,
+        openai_oauth: &crate::service::openai_oauth::OpenAIOAuthService,
+    ) -> Result<Account, AppError> {
+        let mut latest = self.store.get_by_id(id).await?;
+        // double-check: 别人可能已经刷过了
+        if latest.has_valid_oauth_access_token(OAUTH_REFRESH_BUFFER_SECONDS) {
+            return Ok(latest);
+        }
+        if latest.refresh_token.is_empty() {
+            return Err(AppError::ServiceUnavailable(
+                "openai refresh token is empty".into(),
+            ));
+        }
+
+        match openai_oauth
+            .refresh_token(&latest.refresh_token, &latest.proxy_url)
+            .await
+        {
+            Ok(r) => {
+                latest.access_token = r.access_token.clone();
+                if !r.refresh_token.is_empty() {
+                    latest.refresh_token = r.refresh_token.clone();
+                }
+                if let Some(t) = chrono::TimeZone::timestamp_opt(&Utc, r.expires_at, 0).single() {
+                    latest.expires_at = Some(t);
+                }
+                // 把 enrich 字段更新到 extra (refresh 可能拿到新 plan_type / org)
+                if !r.chatgpt_account_id.is_empty()
+                    || !r.organization_id.is_empty()
+                    || !r.plan_type.is_empty()
+                {
+                    let mut extra = match latest.extra.as_object() {
+                        Some(o) => o.clone(),
+                        None => serde_json::Map::new(),
+                    };
+                    if !r.chatgpt_account_id.is_empty() {
+                        extra.insert(
+                            "chatgpt_account_id".into(),
+                            serde_json::json!(r.chatgpt_account_id),
+                        );
+                    }
+                    if !r.organization_id.is_empty() {
+                        extra.insert(
+                            "organization_id".into(),
+                            serde_json::json!(r.organization_id),
+                        );
+                    }
+                    if !r.plan_type.is_empty() {
+                        extra.insert("plan_type".into(), serde_json::json!(r.plan_type));
+                    }
+                    latest.extra = serde_json::Value::Object(extra);
+                }
+                self.update_account(&latest).await?;
+                Ok(latest)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let _ = self.store.update_auth_error(id, &msg).await;
+                // 如果当前 access_token 还能撑一会就先用旧的
+                if !latest.access_token.is_empty()
+                    && latest.expires_at.map(|t| t > Utc::now()).unwrap_or(false)
+                {
+                    warn!(
+                        "openai refresh failed for account {}, using current access token until expiry: {}",
+                        id, msg
+                    );
+                    return Ok(latest);
+                }
+                Err(AppError::ServiceUnavailable(format!(
+                    "openai refresh failed: {}",
+                    msg
+                )))
+            }
+        }
     }
 }
 

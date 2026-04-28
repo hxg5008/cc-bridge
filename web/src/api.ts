@@ -45,6 +45,8 @@ export interface Account {
     heap_used_range?: number[]
   }
   billing_mode: string
+  platform?: string
+  extra?: Record<string, unknown>
   account_uuid?: string | null
   organization_uuid?: string | null
   subscription_type?: string | null
@@ -112,7 +114,13 @@ export interface ApiToken {
 }
 
 export interface Dashboard {
-  accounts: { total: number; active: number; error: number; disabled: number };
+  accounts: {
+    total: number;
+    active: number;
+    error: number;
+    disabled: number;
+    by_platform?: Record<string, number>;
+  };
   tokens: number;
 }
 
@@ -130,6 +138,22 @@ export interface OAuthExchangeResult {
   account_uuid: string;
   organization_uuid: string;
   email_address: string;
+}
+
+// SessionKey 自动 OAuth 相关
+export interface CookieAuthBatchResultItem {
+  session_key_preview: string;
+  success: boolean;
+  account_id?: number;
+  email?: string;
+  error?: string;
+}
+
+export interface CookieAuthBatchResponse {
+  total: number;
+  success: number;
+  failed: number;
+  results: CookieAuthBatchResultItem[];
 }
 
 export const api = {
@@ -155,4 +179,111 @@ export const api = {
     request<OAuthExchangeResult>('POST', '/admin/oauth/exchange-code', { session_id: sessionId, code }),
   exchangeSetupTokenCode: (sessionId: string, code: string) =>
     request<OAuthExchangeResult>('POST', '/admin/oauth/exchange-setup-token-code', { session_id: sessionId, code }),
+
+  // SessionKey-based 自动 OAuth (sub2api 风格)
+  cookieAuth: (sessionKey: string, proxyUrl?: string, scope: 'full' | 'inference' = 'full') =>
+    request<OAuthExchangeResult>('POST', '/admin/accounts/cookie-auth', {
+      session_key: sessionKey,
+      proxy_url: proxyUrl || null,
+      scope,
+    }),
+  cookieAuthCreate: (params: {
+    session_key: string;
+    proxy_url?: string;
+    scope?: 'full' | 'inference';
+    name?: string;
+    priority?: number;
+    concurrency?: number;
+    billing_mode?: string;
+    auto_telemetry?: boolean;
+    subscription_type?: string;
+  }) => request<Account>('POST', '/admin/accounts/cookie-auth-create', params),
+  cookieAuthCreateBatch: (params: {
+    session_keys: string[];
+    proxy_url?: string;
+    scope?: 'full' | 'inference';
+    concurrency_limit?: number;
+    priority?: number;
+    concurrency?: number;
+    billing_mode?: string;
+    auto_telemetry?: boolean;
+    subscription_type?: string;
+  }) => request<CookieAuthBatchResponse>('POST', '/admin/accounts/cookie-auth-create/batch', params),
+
+  // OpenAI 账号 (Phase 2)
+  createOpenAIAccount: (params: {
+    name?: string;
+    email: string;
+    credential_type?: 'api_key' | 'codex_token' | 'oauth' | 'cookie';
+    api_key?: string;
+    access_token?: string;
+    refresh_token?: string;
+    base_url?: string;
+    user_agent?: string;
+    chatgpt_account_id?: string;
+    organization_id?: string;
+    proxy_url?: string;
+    priority?: number;
+    concurrency?: number;
+  }) => request<Account>('POST', '/admin/accounts/openai', params),
+
+  // OpenAI OAuth (Phase 4)
+  openaiGenerateAuthUrl: (params: { redirect_uri?: string; proxy_url?: string }) =>
+    request<{ auth_url: string; session_id: string; state: string }>(
+      'POST',
+      '/admin/openai-oauth/generate-auth-url',
+      params,
+    ),
+  openaiExchangeCode: (params: { session_id: string; code: string; state?: string }) =>
+    request<OpenAITokenInfo>('POST', '/admin/openai-oauth/exchange-code', params),
+  openaiRefreshToken: (params: { refresh_token: string; proxy_url?: string }) =>
+    request<OpenAITokenInfo>('POST', '/admin/openai-oauth/refresh-token', params),
+
+  // OpenAI Refresh Token 一键导入 (sub2api 风格)
+  openaiRtImport: (params: {
+    refresh_token: string;
+    email?: string;
+    proxy_url?: string;
+    user_agent?: string;
+    base_url?: string;
+    priority?: number;
+    concurrency?: number;
+  }) => request<Account>('POST', '/admin/accounts/openai-rt-import', params),
+  openaiRtImportBatch: (params: {
+    refresh_tokens: string[];
+    proxy_url?: string;
+    user_agent?: string;
+    base_url?: string;
+    concurrency_limit?: number;
+    priority?: number;
+    concurrency?: number;
+  }) => request<OpenAIRtBatchResponse>('POST', '/admin/accounts/openai-rt-import/batch', params),
+}
+
+export interface OpenAIRtBatchItem {
+  rt_preview: string;
+  success: boolean;
+  account_id?: number;
+  email?: string;
+  error?: string;
+}
+
+export interface OpenAIRtBatchResponse {
+  total: number;
+  success: number;
+  failed: number;
+  results: OpenAIRtBatchItem[];
+}
+
+export interface OpenAITokenInfo {
+  access_token: string;
+  refresh_token: string;
+  id_token: string;
+  expires_in: number;
+  expires_at: number;
+  email: string;
+  chatgpt_account_id: string;
+  chatgpt_user_id: string;
+  plan_type: string;
+  organization_id: string;
 }
