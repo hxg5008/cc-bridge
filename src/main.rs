@@ -6,8 +6,26 @@ use claude_code_gateway::store;
 use std::sync::Arc;
 use tracing::info;
 
-#[tokio::main]
-async fn main() {
+/// Tokio worker 线程数显式配置:
+/// - 默认 (`#[tokio::main]` 不带参数) 是 `available_parallelism()` 即逻辑核数,
+///   但在 docker / cgroups / numa-pinning 下可能误报机器物理核数, 导致 worker 过多。
+/// - 显式 = `num_cpus::get()` 读 cgroup-aware 的有效核数, 跟容器 CPU limit 对齐。
+/// - 可通过 `TOKIO_WORKER_THREADS` 环境变量进一步覆盖 (运行时压测调参用)。
+fn worker_threads() -> usize {
+    if let Ok(s) = std::env::var("TOKIO_WORKER_THREADS") {
+        if let Ok(n) = s.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    n.max(2) // 最少 2 worker, 避免单核机降级到完全串行
+}
+
+fn main() {
     // CLI flags: --version / -V (升级脚本检查当前版本用)
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("cc-bridge {}", env!("CARGO_PKG_VERSION"));
@@ -22,6 +40,19 @@ async fn main() {
         return;
     }
 
+    let workers = worker_threads();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .expect("build tokio runtime failed");
+
+    runtime.block_on(async move {
+        run(workers).await;
+    });
+}
+
+async fn run(workers: usize) {
     let cfg = config::Config::load();
 
     // 初始化日志
@@ -31,6 +62,8 @@ async fn main() {
                 .unwrap_or_else(|_| cfg.log_level.clone().into()),
         )
         .init();
+
+    info!("tokio runtime: {} worker threads", workers);
 
     // 标记启动时间, 供 /metrics ccbridge_uptime_seconds gauge 使用
     service::metrics::METRICS.mark_started();

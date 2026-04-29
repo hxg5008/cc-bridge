@@ -9,8 +9,8 @@
 
 use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use dashmap::DashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
@@ -191,14 +191,16 @@ impl Availability {
 
 pub struct LimitStore {
     store: Arc<AccountStore>,
-    states: Mutex<HashMap<i64, LimitState>>,
+    /// 账号限流热态。lock-free 并发哈希(替了 std::sync::Mutex<HashMap>),
+    /// 高 RPS 下不会再因为单点锁阻塞 tokio worker 线程。
+    states: DashMap<i64, LimitState>,
 }
 
 impl LimitStore {
     pub fn new(store: Arc<AccountStore>) -> Self {
         Self {
             store,
-            states: Mutex::new(HashMap::new()),
+            states: DashMap::new(),
         }
     }
 
@@ -211,8 +213,7 @@ impl LimitStore {
     ///   `rate_limited_until = now + retry-after`，缺 retry-after 则用 60s 默认值。
     /// - **无 unified-\* 字段 + 非 429**：空闲响应，不更新内存，返回 false。
     pub fn absorb_headers(&self, account_id: i64, status: u16, headers: &HeaderMap) -> bool {
-        let mut map = self.states.lock().unwrap();
-        let prev = map.get(&account_id).cloned().unwrap_or_default();
+        let prev = self.states.get(&account_id).map(|r| r.clone()).unwrap_or_default();
 
         let Some(mut new_state) = compute_new_state(&prev, status, headers) else {
             return false;
@@ -249,26 +250,25 @@ impl LimitStore {
             );
         }
         let should_flush = flush_r.is_some();
-        map.insert(account_id, new_state);
+        self.states.insert(account_id, new_state);
         should_flush
     }
 
     /// Selector 用：当前账号可否调度。内存无记录 → 乐观 Available。
     pub fn availability(&self, account_id: i64) -> Availability {
-        let map = self.states.lock().unwrap();
-        let Some(state) = map.get(&account_id) else {
+        let Some(state_ref) = self.states.get(&account_id) else {
             return Availability::Available;
         };
-        judge_availability(state)
+        judge_availability(state_ref.value())
     }
 
     /// Sonnet selector 用：只检查 Sonnet 专属 ban 和全局 Rejected。
     /// 5h/7d 窗口利用率、RPM/TPM 预抢等本地软限流均不适用于 Sonnet 请求。
     pub fn sonnet_available(&self, account_id: i64) -> bool {
-        let map = self.states.lock().unwrap();
-        let Some(state) = map.get(&account_id) else {
+        let Some(state_ref) = self.states.get(&account_id) else {
             return true;
         };
+        let state = state_ref.value();
         if let Some(until) = state.sonnet_limited_until {
             if until > Utc::now() {
                 return false;
@@ -289,11 +289,11 @@ impl LimitStore {
     /// 由 gateway 在 absorb_headers 返回 true 时 tokio::spawn 调用。
     pub async fn flush_to_db(&self, account_id: i64) -> Result<(), AppError> {
         let (json, limit_until) = {
-            let map = self.states.lock().unwrap();
-            let Some(state) = map.get(&account_id) else {
+            let Some(state_ref) = self.states.get(&account_id) else {
                 debug!("limit flush: account {} not in memory, skip", account_id);
                 return Ok(());
             };
+            let state = state_ref.value();
             // DB 列 rate_limit_reset_at 取"最迟的限流截止时刻"：
             //   优先 5h/7d 瓶颈窗口；没有瓶颈但存在短期隔离时，退回到 rate_limited_until。
             let db_reset = bottleneck_limit_until(state).or(state.rate_limited_until);
@@ -328,8 +328,7 @@ impl LimitStore {
     /// `select_account` 不会发请求 → 没有 `absorb_headers` → 状态永远不刷新）。
     /// 即使误清，下一次真请求 `absorb_headers` 会立刻把正确状态写回。
     pub fn ingest_usage_json(&self, account_id: i64, usage: &serde_json::Value) {
-        let mut map = self.states.lock().unwrap();
-        let mut state = map.get(&account_id).cloned().unwrap_or_default();
+        let mut state = self.states.get(&account_id).map(|r| r.clone()).unwrap_or_default();
 
         // 先解析,留住"本次观测"的窗口结果用于死锁保护判断,然后再覆盖到 state。
         let parsed_five = parse_usage_json_window(usage, "five_hour");
@@ -370,7 +369,7 @@ impl LimitStore {
         }
 
         state.updated_at = Some(Instant::now());
-        map.insert(account_id, state);
+        self.states.insert(account_id, state);
     }
 
     /// 强制清除内存里的本地软限流标记（admin 手动 reset 路径）。
@@ -381,11 +380,11 @@ impl LimitStore {
     ///
     /// 返回布尔表示是否真的清了什么（用于 admin 反馈）。
     pub fn clear_runtime_flags(&self, account_id: i64) -> bool {
-        let mut map = self.states.lock().unwrap();
-        let state = match map.get_mut(&account_id) {
+        let mut state_ref = match self.states.get_mut(&account_id) {
             Some(s) => s,
             None => return false,
         };
+        let state = state_ref.value_mut();
         let mut cleared = false;
         if state.rate_limited_until.is_some() {
             state.rate_limited_until = None;
@@ -404,9 +403,8 @@ impl LimitStore {
     /// 暴露给 UI: 当前内存里仍有效的 `rate_limited_until`。
     /// 返回 `None` 表示该账号没有任何短期 ban，或已过期（UI 不应显示倒计时）。
     pub fn peek_rate_limited_until(&self, account_id: i64) -> Option<DateTime<Utc>> {
-        let map = self.states.lock().unwrap();
-        let state = map.get(&account_id)?;
-        let until = state.rate_limited_until?;
+        let state_ref = self.states.get(&account_id)?;
+        let until = state_ref.value().rate_limited_until?;
         if until > Utc::now() {
             Some(until)
         } else {

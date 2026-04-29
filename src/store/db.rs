@@ -1,6 +1,7 @@
 use crate::config::DatabaseConfig;
 use sqlx::AnyPool;
 use sqlx::Connection;
+use sqlx::any::AnyPoolOptions;
 use sqlx::postgres::PgConnection;
 use std::collections::HashSet;
 use std::path::Path;
@@ -10,8 +11,26 @@ use tracing::info;
 
 const SCHEMA_VERSION: i32 = 2;
 
+/// 连接池配置: max_connections 决定网关并发能跑多高的 DB QPS。
+/// 50 是单实例 1500-2000 RPS 场景下的工程取舍 —— PG 默认 max_connections=100,
+/// 留一半给其他客户端 (admin tooling / pg_dump 等)。
+const DB_POOL_MAX_CONNECTIONS: u32 = 50;
+/// 最少保持几个空闲连接, 避免冷启动峰值排队。
+const DB_POOL_MIN_CONNECTIONS: u32 = 5;
+/// 拿连接的最大等待时长。超时直接错, 不阻塞 tokio worker。
+const DB_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn init_db(dsn: &str) -> Result<AnyPool, sqlx::Error> {
-    let pool = AnyPool::connect(dsn).await?;
+    let pool = AnyPoolOptions::new()
+        .max_connections(DB_POOL_MAX_CONNECTIONS)
+        .min_connections(DB_POOL_MIN_CONNECTIONS)
+        .acquire_timeout(DB_POOL_ACQUIRE_TIMEOUT)
+        .connect(dsn)
+        .await?;
+    info!(
+        "db pool: max={} min={} acquire_timeout={:?}",
+        DB_POOL_MAX_CONNECTIONS, DB_POOL_MIN_CONNECTIONS, DB_POOL_ACQUIRE_TIMEOUT
+    );
     Ok(pool)
 }
 
