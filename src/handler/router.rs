@@ -82,6 +82,7 @@ pub fn build_router(
             "/admin/accounts/:id",
             put(update_account).delete(delete_account),
         )
+        .route("/admin/accounts/batch-delete", post(batch_delete_accounts))
         .route("/admin/accounts/:id/test", post(test_account))
         .route("/admin/accounts/:id/usage", post(refresh_usage))
         .route("/admin/accounts/refresh-all-usage", post(refresh_all_usage))
@@ -829,6 +830,53 @@ async fn delete_account(
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.account_svc.delete_account(id).await?;
     Ok(Json(serde_json::json!({"status": "deleted"})))
+}
+
+#[derive(Deserialize)]
+struct BatchDeleteRequest {
+    ids: Vec<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct BatchDeleteFailure {
+    id: i64,
+    error: String,
+}
+
+/// POST /admin/accounts/batch-delete — 批量删除账号
+///
+/// 单条失败不阻塞其他, 返回成功 / 失败计数 + 失败明细 (最多 5 条)。
+async fn batch_delete_accounts(
+    State(state): State<AppState>,
+    Json(req): Json<BatchDeleteRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if req.ids.is_empty() {
+        return Err(AppError::BadRequest("ids 为空".into()));
+    }
+    let mut deleted = 0i32;
+    let mut failed = 0i32;
+    let mut errors: Vec<BatchDeleteFailure> = Vec::new();
+
+    for id in &req.ids {
+        match state.account_svc.delete_account(*id).await {
+            Ok(()) => deleted += 1,
+            Err(e) => {
+                failed += 1;
+                if errors.len() < 5 {
+                    errors.push(BatchDeleteFailure {
+                        id: *id,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "deleted": deleted,
+        "failed": failed,
+        "errors": errors,
+    })))
 }
 
 async fn test_account(

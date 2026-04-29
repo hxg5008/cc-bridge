@@ -414,6 +414,76 @@ async function executeDelete() {
   }
 }
 
+// ============ 紧凑视图: 多选 + 批量删除 ============
+
+/** 选中的账号 ID 集合 (仅紧凑视图用) */
+const selectedIds = ref<Set<number>>(new Set());
+
+/** 当前页里所有 ID (用于全选/反选判断) */
+const visibleIds = computed(() => filteredAccounts.value.map(a => a.id));
+/** 表头全选 checkbox 状态: false / true / indeterminate (部分选中) */
+const allSelected = computed(() => {
+  if (visibleIds.value.length === 0) return false;
+  return visibleIds.value.every(id => selectedIds.value.has(id));
+});
+const someSelected = computed(() => {
+  if (visibleIds.value.length === 0) return false;
+  return !allSelected.value && visibleIds.value.some(id => selectedIds.value.has(id));
+});
+
+function toggleSelect(id: number) {
+  if (selectedIds.value.has(id)) selectedIds.value.delete(id);
+  else selectedIds.value.add(id);
+  // 触发 reactivity (Set 变更需要新的引用)
+  selectedIds.value = new Set(selectedIds.value);
+}
+
+function toggleSelectAll() {
+  if (allSelected.value) {
+    // 当前页全选状态 → 取消选中本页所有
+    visibleIds.value.forEach(id => selectedIds.value.delete(id));
+  } else {
+    // 否则: 选中本页所有
+    visibleIds.value.forEach(id => selectedIds.value.add(id));
+  }
+  selectedIds.value = new Set(selectedIds.value);
+}
+
+function clearSelection() {
+  selectedIds.value = new Set();
+}
+
+/** 批量删除确认弹窗状态 */
+const showBatchDeleteConfirm = ref(false);
+const batchDeleting = ref(false);
+
+function openBatchDeleteConfirm() {
+  if (selectedIds.value.size === 0) return;
+  showBatchDeleteConfirm.value = true;
+}
+
+async function executeBatchDelete() {
+  const ids = Array.from(selectedIds.value);
+  if (ids.length === 0) return;
+  batchDeleting.value = true;
+  try {
+    const r = await api.batchDeleteAccounts(ids);
+    if (r.failed === 0) {
+      toast(`成功删除 ${r.deleted} 个账号`, 'success');
+    } else {
+      toast(`删除完成: 成功 ${r.deleted}, 失败 ${r.failed}`, 'error');
+    }
+    selectedIds.value = new Set();
+    showBatchDeleteConfirm.value = false;
+    await load();
+    emit('refresh');
+  } catch (e: unknown) {
+    toast((e as Error).message || '批量删除失败');
+  } finally {
+    batchDeleting.value = false;
+  }
+}
+
 /**
  * 测试账号连接
  * @param id 账号 ID
@@ -1145,12 +1215,46 @@ async function copyText(text: string) {
       </div>
     </div>
 
+    <!-- 紧凑视图: 批量操作工具条 (仅选中 ≥1 时显示) -->
+    <div v-if="viewMode === 'compact' && selectedIds.size > 0"
+         class="bg-amber-50 border border-amber-200 rounded-xl px-4 py-2 flex items-center justify-between sticky top-2 z-30 shadow-sm">
+      <div class="text-sm text-amber-800">
+        已选中 <span class="font-semibold">{{ selectedIds.size }}</span> 个账号
+      </div>
+      <div class="flex gap-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          @click="clearSelection"
+          class="text-[#8c8475] hover:bg-amber-100/50 h-8 px-3 text-xs"
+        >
+          取消选择
+        </Button>
+        <Button
+          @click="openBatchDeleteConfirm"
+          class="bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg h-8 px-4 text-xs"
+        >
+          批量删除 ({{ selectedIds.size }})
+        </Button>
+      </div>
+    </div>
+
     <!-- 紧凑视图: 表格 -->
     <div v-if="viewMode === 'compact'" class="bg-white border border-[#e8e2d9] rounded-xl overflow-hidden">
       <div class="overflow-x-auto">
         <table class="min-w-full text-sm">
           <thead class="bg-[#f9f6f1] border-b border-[#e8e2d9]">
             <tr class="text-left text-xs font-medium text-[#8c8475]">
+              <th class="px-3 py-2.5 w-8">
+                <input
+                  type="checkbox"
+                  :checked="allSelected"
+                  :indeterminate.prop="someSelected"
+                  @change="toggleSelectAll"
+                  class="cursor-pointer accent-[#c4704f]"
+                  title="全选当前页"
+                />
+              </th>
               <th class="px-3 py-2.5 whitespace-nowrap">Email / Name</th>
               <th class="px-2 py-2.5 whitespace-nowrap">平台</th>
               <th class="px-2 py-2.5 whitespace-nowrap">鉴权</th>
@@ -1165,8 +1269,17 @@ async function copyText(text: string) {
               v-for="a in filteredAccounts"
               :key="a.id"
               class="border-b border-[#f0ebe4] hover:bg-[#f9f6f1]/50 cursor-pointer transition-colors"
+              :class="selectedIds.has(a.id) ? 'bg-amber-50/40' : ''"
               @click="openEdit(a)"
             >
+              <td class="px-3 py-2 align-middle w-8" @click.stop>
+                <input
+                  type="checkbox"
+                  :checked="selectedIds.has(a.id)"
+                  @change="toggleSelect(a.id)"
+                  class="cursor-pointer accent-[#c4704f]"
+                />
+              </td>
               <td class="px-3 py-2 align-middle">
                 <div class="font-medium text-[#29261e] truncate max-w-[260px]" :title="a.email">{{ a.email }}</div>
                 <div v-if="a.name && a.name !== a.email" class="text-xs text-[#8c8475] truncate max-w-[260px]">{{ a.name }}</div>
@@ -1958,6 +2071,36 @@ async function copyText(text: string) {
             class="bg-red-500 hover:bg-red-600 text-white font-medium rounded-xl transition-all duration-200"
           >
             删除
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 批量删除确认 -->
+    <Dialog v-model:open="showBatchDeleteConfirm">
+      <DialogContent class="bg-white border-[#e8e2d9] rounded-2xl text-[#29261e] sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle class="text-[#29261e]">批量删除确认</DialogTitle>
+          <DialogDescription class="text-[#8c8475]">
+            确认删除 <span class="font-semibold text-red-600">{{ selectedIds.size }}</span> 个账号?
+            此操作 <span class="font-semibold">不可撤销</span>，删除后账号 + 关联数据全部清除。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter class="gap-2 pt-4">
+          <Button
+            variant="ghost"
+            @click="showBatchDeleteConfirm = false"
+            :disabled="batchDeleting"
+            class="text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]"
+          >
+            取消
+          </Button>
+          <Button
+            @click="executeBatchDelete"
+            :disabled="batchDeleting"
+            class="bg-red-500 hover:bg-red-600 text-white font-medium rounded-xl transition-all duration-200"
+          >
+            {{ batchDeleting ? '删除中...' : `删除 ${selectedIds.size} 个` }}
           </Button>
         </DialogFooter>
       </DialogContent>

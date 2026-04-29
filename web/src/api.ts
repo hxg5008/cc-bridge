@@ -189,6 +189,11 @@ export const api = {
   createAccount: (a: Partial<Account>) => request<Account>('POST', '/admin/accounts', a),
   updateAccount: (id: number, a: Partial<Account>) => request<Account>('PUT', `/admin/accounts/${id}`, a),
   deleteAccount: (id: number) => request<void>('DELETE', `/admin/accounts/${id}`),
+  /** 批量删除账号。后端逐个删,单条失败不阻塞,返回成功/失败计数 */
+  batchDeleteAccounts: (ids: number[]) =>
+    request<{ status: string; deleted: number; failed: number; errors: { id: number; error: string }[] }>(
+      'POST', '/admin/accounts/batch-delete', { ids }
+    ),
   testAccount: (id: number) => request<{ status: string; message?: string }>('POST', `/admin/accounts/${id}/test`),
   refreshUsage: (id: number) => request<{ status: string; usage?: UsageData; message?: string }>('POST', `/admin/accounts/${id}/usage`),
   /** 批量刷新所有 OAuth 账号用量。后端走每账号 60s 缓存,频繁调不会真打上游。 */
