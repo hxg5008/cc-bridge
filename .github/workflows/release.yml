@@ -152,7 +152,10 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # 临时只 build amd64 (用户生产 x86_64); arm64 cross-compile 在 docker
+          # buildx + qemu emulation 下偶发 cargo exit 101, 后续单独修。
+          # 业务服务器一律 x86_64, amd64 镜像够用。
+          platforms: linux/amd64
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
