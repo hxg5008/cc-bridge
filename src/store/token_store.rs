@@ -6,14 +6,35 @@ use crate::model::api_token::ApiToken;
 
 pub struct TokenStore {
     pool: AnyPool,
+    /// `get_by_token` 的 LRU 缓存: token 字符串 → (ApiToken, 缓存时间)。
+    /// 高 RPS 下 100% 请求都打 DB 查 token 是无意义的浪费, 缓存 30s 既能挡住
+    /// 99% 的 SELECT 又能让 admin 改 token / 禁用 token 在 30s 内生效。
+    /// 每次 create/update/delete 主动 invalidate 整个缓存以保证强一致 (token 数量
+    /// 通常 ≤ 几百, 整表清掉成本极低)。
+    cache: dashmap::DashMap<String, (ApiToken, std::time::Instant)>,
 }
+
+/// Token 缓存 TTL: 30 秒。短到能让 admin 改 token 几乎实时生效, 长到能挡掉
+/// 大部分热路径 SELECT。
+const TOKEN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// 缓存硬上限 (修 N11): 防恶意大量随机 token 把缓存撑爆。
+/// 商用 200-300 DAU 总 token 数通常 < 1000, 上限 10K 留 10x 余量。
+const TOKEN_CACHE_HARD_CAP: usize = 10_000;
 
 const TOKEN_COLS_PG_TEXT: &str =
     "id, name, token, allowed_accounts, blocked_accounts, status, created_at::text AS created_at, updated_at::text AS updated_at";
 
 impl TokenStore {
     pub fn new(pool: AnyPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            cache: dashmap::DashMap::new(),
+        }
+    }
+
+    /// 主动清空整个 token 缓存 (admin 改 token 后调用, 保证下次 get_by_token 命中新数据)。
+    fn invalidate_cache(&self) {
+        self.cache.clear();
     }
 
     fn now_expr(&self) -> &str {
@@ -72,6 +93,7 @@ impl TokenStore {
             .execute(&self.pool)
             .await?;
         t.id = result.last_insert_id().unwrap_or(0) as i64;
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -89,6 +111,7 @@ impl TokenStore {
             .bind(t.id)
             .execute(&self.pool)
             .await?;
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -98,6 +121,7 @@ impl TokenStore {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -112,8 +136,19 @@ impl TokenStore {
         Ok(self.row_to_token(&row))
     }
 
-    /// 按 token 值查询活跃令牌
+    /// 按 token 值查询活跃令牌 — 带 30s LRU 缓存
     pub async fn get_by_token(&self, token: &str) -> Result<Option<ApiToken>, AppError> {
+        // fast path: cache 命中 + 未过期
+        if let Some(entry) = self.cache.get(token) {
+            let (t, ts) = entry.value();
+            if ts.elapsed() < TOKEN_CACHE_TTL {
+                return Ok(Some(t.clone()));
+            }
+            // 过期, 删除让下面去 DB 拉
+            drop(entry);
+            self.cache.remove(token);
+        }
+        // slow path: 打 DB
         let q = format!(
             "SELECT {} FROM api_tokens WHERE token=$1 AND status='active'",
             self.select_token_cols()
@@ -122,7 +157,21 @@ impl TokenStore {
             .bind(token)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|r| self.row_to_token(&r)))
+        let result = row.map(|r| self.row_to_token(&r));
+        // 只缓存命中的; miss 不缓存避免被穷举攻击撑爆内存
+        if let Some(ref t) = result {
+            // 修 N11: 命中硬上限时不再插入, 防恶意大量真 token 撑爆
+            if self.cache.len() < TOKEN_CACHE_HARD_CAP {
+                self.cache
+                    .insert(token.to_string(), (t.clone(), std::time::Instant::now()));
+            } else {
+                tracing::warn!(
+                    "token_store cache hit hard cap ({}), not inserting new entry",
+                    TOKEN_CACHE_HARD_CAP
+                );
+            }
+        }
+        Ok(result)
     }
 
     /// 列出所有令牌

@@ -2,11 +2,15 @@ use chrono::Utc;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{info, warn};
 use uuid::Uuid;
+// parking_lot::Mutex 替 std::sync::Mutex (修 N1):
+// std Mutex 持锁时 panic 会让锁中毒, 所有后续 lock() 全 panic, 整个 cooldown
+// 子系统永久挂掉; parking_lot 不会中毒, panic 后下次 lock() 仍可用。
+use parking_lot::Mutex;
 
 use crate::error::AppError;
 use crate::model::account::{Account, AccountAuthType};
@@ -58,6 +62,9 @@ pub struct AccountService {
     limit_store: Arc<LimitStore>,
     /// 账号级 `/api/oauth/usage` 429 冷却（in-memory，重启即清空，无需持久化）。
     usage_cooldown: Mutex<HashMap<i64, Instant>>,
+    /// 用于 refresh_token 失效时的 session_key 自愈 fallback。
+    /// Optional 是为了向后兼容（旧测试代码可能不传）。
+    oauth_flow_svc: Option<Arc<crate::service::oauth_flow::OAuthFlowService>>,
 }
 
 impl AccountService {
@@ -71,12 +78,23 @@ impl AccountService {
             cache,
             limit_store,
             usage_cooldown: Mutex::new(HashMap::new()),
+            oauth_flow_svc: None,
         }
+    }
+
+    /// 注入 OAuthFlowService，用于 refresh 失败时的 session_key 自愈。
+    /// 在 main.rs 启动时调用。
+    pub fn with_oauth_flow(
+        mut self,
+        oauth_flow_svc: Arc<crate::service::oauth_flow::OAuthFlowService>,
+    ) -> Self {
+        self.oauth_flow_svc = Some(oauth_flow_svc);
+        self
     }
 
     /// 当前是否处于 429 冷却期。
     fn usage_in_cooldown(&self, id: i64) -> bool {
-        let mut map = self.usage_cooldown.lock().unwrap();
+        let mut map = self.usage_cooldown.lock();
         match map.get(&id) {
             Some(until) if *until > Instant::now() => true,
             Some(_) => {
@@ -88,7 +106,7 @@ impl AccountService {
     }
 
     fn mark_usage_cooldown(&self, id: i64) {
-        let mut map = self.usage_cooldown.lock().unwrap();
+        let mut map = self.usage_cooldown.lock();
         map.insert(id, Instant::now() + USAGE_429_COOLDOWN);
     }
 
@@ -130,7 +148,14 @@ impl AccountService {
     }
 
     pub async fn delete_account(&self, id: i64) -> Result<(), AppError> {
-        self.store.delete(id).await
+        let r = self.store.delete(id).await;
+        // 删账号同时清掉 LimitStore + metrics 里的 per-account 内存条目
+        // (修 P2-N16: 防止删号后内存里幽灵账号持续累积)
+        if r.is_ok() {
+            self.limit_store.remove_account(id);
+            crate::service::metrics::METRICS.remove_account(id);
+        }
+        r
     }
 
     /// 数据库连通性检查 (健康端点 /readyz 用)。
@@ -165,6 +190,10 @@ impl AccountService {
         allowed_ids: &[i64],
         skip_rate_limit_filter: bool,
     ) -> Result<Account, AppError> {
+        // sticky 首选账号被临时限流时保留 sticky，本次走 fallback 选别的号；
+        // 等首选恢复后下次请求能继续命中。仅在永久失效（账号 disabled / 被删 / 被 token 黑名单）时删 sticky。
+        let mut sticky_preserved = false;
+
         // 检查粘性会话
         if !session_hash.is_empty() {
             if let Ok(Some(account_id)) = self.cache.get_session_account_id(session_hash).await {
@@ -189,9 +218,39 @@ impl AccountService {
                         {
                             return Ok(account);
                         }
+                        // 校验失败：判断是临时还是永久
+                        // 账号本身正常（schedulable + 通过权限）但只是被限流 → 临时，保留 sticky
+                        // 否则（账号挂了 / 被黑名单）→ 永久，删 sticky
+                        if account.is_schedulable()
+                            && id_allowed
+                            && !exclude_ids.contains(&account_id)
+                        {
+                            sticky_preserved = true;
+                            crate::service::metrics::METRICS.record_sticky_preserved();
+                            // 启动后头 60s 内的 sticky-preserved 大概率是
+                            // "Redis sticky 还在但内存 LimitStore 是空的" 引起,
+                            // 单独计数方便观察重启抖动 (Phase2: 重启第一波监控)
+                            let started = crate::service::metrics::METRICS
+                                .started_at_unix
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            let now = chrono::Utc::now().timestamp();
+                            if started > 0 && now - started < 60 {
+                                crate::service::metrics::METRICS
+                                    .record_post_restart_first_select();
+                            }
+                            info!(
+                                "sticky preserved for account {} (rate-limited, will retry next request)",
+                                account_id
+                            );
+                        } else {
+                            let _ = self.cache.delete_session(session_hash).await;
+                            crate::service::metrics::METRICS.record_sticky_evicted();
+                        }
+                    } else {
+                        // 账号查不到（被删了）→ 永久失效
+                        let _ = self.cache.delete_session(session_hash).await;
+                        crate::service::metrics::METRICS.record_sticky_evicted();
                     }
-                    // 过期绑定，删除
-                    let _ = self.cache.delete_session(session_hash).await;
                 }
             }
         }
@@ -248,10 +307,15 @@ impl AccountService {
         }
 
         // 按优先级分组，同优先级内随机选择
-        let selected = select_by_priority(&candidates);
+        // effective_priority = a.priority + LimitStore 软降权 (90-97% util 时 +10)
+        // 让接近满载的号自然落到次选, 健康号先消耗
+        let limit_store = self.limit_store.clone();
+        let selected = select_by_priority(&candidates, |a| {
+            a.priority + limit_store.priority_penalty(a.id)
+        });
 
-        // 绑定粘性会话
-        if !session_hash.is_empty() {
+        // 绑定粘性会话：仅在没有保留的 sticky 时才绑（否则会覆盖被保留的首选）
+        if !session_hash.is_empty() && !sticky_preserved {
             let _ = self
                 .cache
                 .set_session_account_id(session_hash, selected.id, STICKY_SESSION_TTL)
@@ -276,6 +340,9 @@ impl AccountService {
     ) -> Result<Account, AppError> {
         use crate::service::openai_limit::openai_schedulable;
 
+        // sticky 首选账号被临时限流时保留 sticky；仅永久失效才删
+        let mut sticky_preserved = false;
+
         // 1) 命中粘性会话
         if !session_hash.is_empty() {
             if let Ok(Some(account_id)) = self.cache.get_session_account_id(session_hash).await {
@@ -283,17 +350,36 @@ impl AccountService {
                     if let Ok(account) = self.store.get_by_id(account_id).await {
                         let id_allowed =
                             allowed_ids.is_empty() || allowed_ids.contains(&account_id);
+                        let scheduable = openai_schedulable(&account);
                         if account.platform == "openai"
                             && account.is_schedulable()
                             && !exclude_ids.contains(&account_id)
                             && id_allowed
-                            && openai_schedulable(&account)
+                            && scheduable
                         {
                             return Ok(account);
                         }
+                        // 平台正确 + 账号正常 + 通过权限 → 仅 codex 用量临时不可调度，保留 sticky
+                        if account.platform == "openai"
+                            && account.is_schedulable()
+                            && id_allowed
+                            && !exclude_ids.contains(&account_id)
+                        {
+                            sticky_preserved = true;
+                            crate::service::metrics::METRICS.record_sticky_preserved();
+                            info!(
+                                "openai sticky preserved for account {} (codex usage / 429, will retry)",
+                                account_id
+                            );
+                        } else {
+                            let _ = self.cache.delete_session(session_hash).await;
+                            crate::service::metrics::METRICS.record_sticky_evicted();
+                        }
+                    } else {
+                        // 账号查不到 → 永久失效
+                        let _ = self.cache.delete_session(session_hash).await;
+                        crate::service::metrics::METRICS.record_sticky_evicted();
                     }
-                    // 过期 / 不再可调度 → 删除粘性绑定
-                    let _ = self.cache.delete_session(session_hash).await;
                 }
             }
         }
@@ -337,10 +423,11 @@ impl AccountService {
             ));
         }
 
-        let selected = select_by_priority(&candidates);
+        // OpenAI 路径不走 LimitStore 软降权 (它有独立的用量门禁), 直接按 a.priority 选
+        let selected = select_by_priority(&candidates, |a| a.priority);
 
-        // 3) 写回粘性绑定
-        if !session_hash.is_empty() {
+        // 3) 写回粘性绑定（仅在没有保留的 sticky 时）
+        if !session_hash.is_empty() && !sticky_preserved {
             let _ = self
                 .cache
                 .set_session_account_id(session_hash, selected.id, STICKY_SESSION_TTL)
@@ -375,6 +462,12 @@ impl AccountService {
     pub fn slot_holder_for(&self, account_id: i64) -> crate::service::gateway::SlotHolder {
         let key = format!("concurrency:account:{}", account_id);
         crate::service::gateway::SlotHolder::new(self.cache.clone(), key)
+    }
+
+    /// 暴露 cache 给 gateway (修 C1: token-level concurrency slot 用)。
+    /// 不希望 gateway 直接持 cache 字段, 通过 account_svc 取避免循环依赖。
+    pub fn cache(&self) -> &Arc<dyn CacheStore> {
+        &self.cache
     }
 
     /// 从 Anthropic API 获取账号用量并缓存到数据库。
@@ -654,12 +747,105 @@ impl AccountService {
                 crate::service::metrics::METRICS
                     .record_oauth_refresh(crate::service::metrics::Platform::Claude, false);
                 let msg = err.to_string();
-                let _ = self.store.update_auth_error(id, &msg).await;
+
+                // 🆕 兜底 1: refresh 挂了但 session_key 还在 → 用 session_key 重新走 cookie_auth
+                // 这是"账号自愈"机制：refresh_token 被吊销 / 过期 → 不需要人工重导
+                if !latest.session_key.is_empty() {
+                    if let Some(ref oauth_flow) = self.oauth_flow_svc {
+                        warn!(
+                            "oauth refresh failed for account {}, trying session_key fallback: {}",
+                            id, msg
+                        );
+                        let req = crate::service::oauth_flow::CookieAuthRequest {
+                            session_key: latest.session_key.clone(),
+                            proxy_url: if latest.proxy_url.is_empty() {
+                                None
+                            } else {
+                                Some(latest.proxy_url.clone())
+                            },
+                            scope: None,
+                        };
+                        match oauth_flow.cookie_auth(&req).await {
+                            Ok(token) => {
+                                let expires_at = if token.expires_at > 0 {
+                                    chrono::TimeZone::timestamp_opt(&Utc, token.expires_at, 0)
+                                        .single()
+                                        .unwrap_or_else(|| {
+                                            Utc::now() + chrono::Duration::seconds(token.expires_in)
+                                        })
+                                } else {
+                                    Utc::now() + chrono::Duration::seconds(token.expires_in)
+                                };
+                                if let Err(e) = self
+                                    .store
+                                    .update_oauth_tokens(
+                                        id,
+                                        &token.access_token,
+                                        &token.refresh_token,
+                                        expires_at,
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        "session_key recovery succeeded but DB update failed for account {}: {}",
+                                        id, e
+                                    );
+                                }
+                                crate::service::metrics::METRICS
+                                    .record_oauth_recovery_session_key(true);
+                                let count = crate::service::metrics::METRICS
+                                    .record_oauth_fallback_for_account(id);
+                                if count >= 3 {
+                                    warn!(
+                                        "oauth fallback for account {} hit {} times — session_key may be stale, re-import recommended",
+                                        id, count
+                                    );
+                                }
+                                info!(
+                                    "oauth recovered via session_key for account {} (refresh_token was {})",
+                                    id,
+                                    if msg.is_empty() { "invalid" } else { msg.as_str() }
+                                );
+                                let _ = self.store.update_auth_error(id, "").await;
+                                return Ok(token.access_token);
+                            }
+                            Err(e) => {
+                                crate::service::metrics::METRICS
+                                    .record_oauth_recovery_session_key(false);
+                                warn!(
+                                    "session_key recovery also failed for account {}: {}",
+                                    id, e
+                                );
+                                // fall through to next fallback
+                            }
+                        }
+                    }
+                }
+
+                // 错误归因 (N2 修复):
+                //   AppError::BadRequest = 上游明确拒绝 (4xx, refresh_token 真的废了) → 写 auth_error
+                //   AppError::Internal / TooManyRequests = 上游抖动 (5xx/网络/429) → 不写 auth_error,
+                //   避免 dashboard 把临时错误显示成账号失效, 误导运维手动停号
+                let is_permanent = matches!(err, AppError::BadRequest(_));
+                if is_permanent {
+                    let _ = self.store.update_auth_error(id, &msg).await;
+                } else {
+                    warn!(
+                        "oauth refresh transient error for account {} (not marking auth_error): {}",
+                        id, msg
+                    );
+                }
+
                 if fallback_is_still_valid && !fallback_access_token.is_empty() {
                     warn!(
                         "oauth refresh failed for account {}, using current access token until expiry: {}",
                         id, msg
                     );
+                    // fallback 旧 token 还有效 → 把可能误标的 auth_error 清掉,
+                    // 因为账号实际上是好的, 只是上游抖了一下
+                    if !is_permanent {
+                        let _ = self.store.update_auth_error(id, "").await;
+                    }
                     return Ok(fallback_access_token);
                 }
                 Err(AppError::ServiceUnavailable(format!(
@@ -685,9 +871,19 @@ impl AccountService {
         reason: &str,
         rate_limit_reset_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<(), AppError> {
-        self.store
+        let r = self
+            .store
             .disable_account(id, status, reason, rate_limit_reset_at)
-            .await
+            .await;
+        // 修 E1: 账号被 disable 时上报 metric, 让 prometheus 能告警
+        // "短时间内 disable 数量增量 > 阈值" (例如 5min 内 ≥3 个号挂掉 → 报警)
+        if r.is_ok() {
+            // reason 多种多样 (403 认证失败 / oauth invalid_grant / 手动停用 ...);
+            // 归类成有限几个标签防 cardinality 爆炸
+            let reason_label = classify_disable_reason(reason);
+            crate::service::metrics::METRICS.record_account_disabled(reason_label);
+        }
+        r
     }
 
     pub async fn enable_account(&self, id: i64) -> Result<(), AppError> {
@@ -891,11 +1087,19 @@ fn categorize_from_db_usage(usage: &serde_json::Value) -> Option<AccountCategori
 /// API 客户端：使用 sha256(UA + 系统提示词/首条消息)。
 /// 会话粘滞时长统一由 CacheStore TTL（24h）决定，不再在哈希键中嵌入小时窗口，
 /// 否则会把实际 sticky 时长截断到 1 小时，并在跨小时边界引入上游账号抖动。
+///
+/// **多租户隔离 (修 N3)**: 同一 session_id / 同一 (UA, content) 在不同 api_token
+/// 下应该路由到独立的 sticky, 否则会出现"用户 A 的 sticky 被用户 B 命中并失效"
+/// 的串号 bug。`api_token_id` 作为 namespace 前缀混入 hash 输入。
+/// 老调用方 (没有 token_id) 传 None 等价于 0, 与历史哈希值不再兼容 — 重启时
+/// 现有 sticky 会失效一次, 短期内缓存命中率下跌, 几分钟内自然恢复。
 pub fn generate_session_hash(
     user_agent: &str,
     body: &serde_json::Value,
     client_type: ClientType,
+    api_token_id: Option<i64>,
 ) -> String {
+    let ns = api_token_id.unwrap_or(0);
     if client_type == ClientType::ClaudeCode {
         if let Some(metadata) = body.get("metadata").and_then(|m| m.as_object()) {
             if let Some(user_id_str) = metadata.get("user_id").and_then(|u| u.as_str()) {
@@ -903,13 +1107,15 @@ pub fn generate_session_hash(
                 if let Ok(uid) = serde_json::from_str::<serde_json::Value>(user_id_str) {
                     if let Some(sid) = uid.get("session_id").and_then(|s| s.as_str()) {
                         if !sid.is_empty() {
-                            return sid.to_string();
+                            // 加 token namespace 前缀, 防止 token_A 和 token_B
+                            // 用了相同 session_id 时被路由到同一账号 sticky
+                            return format!("k{}:{}", ns, sid);
                         }
                     }
                 }
                 // 旧格式
                 if let Some(idx) = user_id_str.rfind("_session_") {
-                    return user_id_str[idx + 9..].to_string();
+                    return format!("k{}:{}", ns, &user_id_str[idx + 9..]);
                 }
             }
         }
@@ -956,28 +1162,61 @@ pub fn generate_session_hash(
         }
     }
 
-    let raw = format!("{}|{}", user_agent, content);
+    let raw = format!("k{}|{}|{}", ns, user_agent, content);
     let hash = Sha256::digest(raw.as_bytes());
     hex::encode(&hash[..16])
 }
 
-fn select_by_priority(accounts: &[Account]) -> Account {
+/// 按优先级选号: 入参 `effective_priority(a)` 给定每个账号的"实际"优先级,
+/// 调用方可借此对接近满载 (90-97%) 的号叠加 SOFT_DEPRIORITIZE_PENALTY=10,
+/// 让健康号自然先被选中。
+///
+/// 优先级数值越小越优先; 同 effective_priority 内随机选一个 (避免热点)。
+fn select_by_priority<F: Fn(&Account) -> i32>(accounts: &[Account], effective_priority: F) -> Account {
     if accounts.len() == 1 {
         return accounts[0].clone();
     }
 
-    // 找到最高优先级（最小数值）
-    let best_priority = accounts.iter().map(|a| a.priority).min().unwrap_or(50);
+    // 找到最高 effective 优先级（最小数值）
+    let best_priority = accounts.iter().map(&effective_priority).min().unwrap_or(50);
 
-    // 收集相同优先级的所有账号
+    // 收集相同 effective 优先级的所有账号
     let best: Vec<&Account> = accounts
         .iter()
-        .filter(|a| a.priority == best_priority)
+        .filter(|a| effective_priority(a) == best_priority)
         .collect();
 
     // 同优先级内随机选择
     let idx = rand::thread_rng().gen_range(0..best.len());
     best[idx].clone()
+}
+
+/// 把 disable_account 的自由文本 reason 归类成有限几个 metric 标签,
+/// 防止 prometheus label cardinality 爆炸 (修 E1)。
+///
+/// 用例:
+///   - "403 认证失败"          → "auth_403"
+///   - "oauth invalid_grant"   → "oauth_invalid_grant"
+///   - "手动停用 via admin UI" → "manual"
+///   - "上游 violation"        → "upstream_violation"
+///   - 其它                    → "other"
+pub fn classify_disable_reason(reason: &str) -> &'static str {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("403") || lower.contains("认证") || lower.contains("auth") {
+        "auth_403"
+    } else if lower.contains("invalid_grant") || lower.contains("invalid grant") {
+        "oauth_invalid_grant"
+    } else if lower.contains("invalid_request") {
+        "oauth_invalid_request"
+    } else if lower.contains("violation") || lower.contains("封禁") || lower.contains("ban") {
+        "upstream_violation"
+    } else if lower.contains("手动") || lower.contains("manual") || lower.contains("admin") {
+        "manual"
+    } else if lower.contains("revoke") || lower.contains("revoked") {
+        "token_revoked"
+    } else {
+        "other"
+    }
 }
 
 #[cfg(test)]
@@ -994,8 +1233,8 @@ mod tests {
             "system": "You are Claude Code",
             "messages": [{"role": "user", "content": "hello"}],
         });
-        let h1 = generate_session_hash(ua, &body, ClientType::API);
-        let h2 = generate_session_hash(ua, &body, ClientType::API);
+        let h1 = generate_session_hash(ua, &body, ClientType::API, None);
+        let h2 = generate_session_hash(ua, &body, ClientType::API, None);
         assert_eq!(
             h1, h2,
             "same (ua, content) must yield identical hash — sticky TTL depends on this"
@@ -1009,8 +1248,8 @@ mod tests {
         let a = json!({"system": "prompt-A", "messages": [{"role": "user", "content": "x"}]});
         let b = json!({"system": "prompt-B", "messages": [{"role": "user", "content": "x"}]});
         assert_ne!(
-            generate_session_hash(ua, &a, ClientType::API),
-            generate_session_hash(ua, &b, ClientType::API)
+            generate_session_hash(ua, &a, ClientType::API, None),
+            generate_session_hash(ua, &b, ClientType::API, None)
         );
     }
 
@@ -1019,8 +1258,8 @@ mod tests {
         let ua = "claude-cli/2.1.81";
         let a = json!({"messages": [{"role": "user", "content": "alpha"}]});
         let b = json!({"messages": [{"role": "user", "content": "beta"}]});
-        let ha = generate_session_hash(ua, &a, ClientType::API);
-        let hb = generate_session_hash(ua, &b, ClientType::API);
+        let ha = generate_session_hash(ua, &a, ClientType::API, None);
+        let hb = generate_session_hash(ua, &b, ClientType::API, None);
         assert_ne!(ha, hb);
     }
 
@@ -1036,7 +1275,7 @@ mod tests {
         // 哈希在极短时间内多次调用必须相同（这是显而易见的，但如果再次引入 Utc::now()，跨小时会翻车）。
         let mut seen = std::collections::HashSet::new();
         for _ in 0..10 {
-            seen.insert(generate_session_hash(ua, &body, ClientType::API));
+            seen.insert(generate_session_hash(ua, &body, ClientType::API, None));
         }
         assert_eq!(
             seen.len(),
@@ -1044,16 +1283,17 @@ mod tests {
             "hash must be pure function of (ua, content); any time dependency is a regression"
         );
 
-        // 进一步：已知等价输入的哈希必须等于已预计算的 sha256 前 16 字节 hex。
+        // 进一步：已知等价输入的哈希必须等于 sha256(k{ns}|ua|content) 前 16 字节 hex。
+        // (修 N3: hash 加 api_token_id 命名空间, ns=0 表示无 token / 历史路径)
         let expected = {
-            let raw = format!("{}|{}", ua, "stable-prompt");
+            let raw = format!("k0|{}|{}", ua, "stable-prompt");
             let digest = Sha256::digest(raw.as_bytes());
             hex::encode(&digest[..16])
         };
         assert_eq!(
-            generate_session_hash(ua, &body, ClientType::API),
+            generate_session_hash(ua, &body, ClientType::API, None),
             expected,
-            "hash formula must be exactly sha256(ua|content)[..16] with no extra inputs"
+            "hash formula must be exactly sha256(k{{ns}}|ua|content)[..16]"
         );
     }
 
@@ -1065,7 +1305,31 @@ mod tests {
                 "user_id": "{\"session_id\":\"sess-abc-123\",\"account_id\":\"xyz\"}"
             }
         });
-        let h = generate_session_hash(ua, &body, ClientType::ClaudeCode);
-        assert_eq!(h, "sess-abc-123");
+        // 修 N3: ClaudeCode 模式也要带 k{ns}: 前缀 防多租户串号
+        let h = generate_session_hash(ua, &body, ClientType::ClaudeCode, None);
+        assert_eq!(h, "k0:sess-abc-123");
+    }
+
+    #[test]
+    fn session_hash_isolated_across_api_tokens() {
+        // 关键回归测试 (修 N3): 相同 (ua, body) 不同 api_token_id 必须产生不同 hash,
+        // 否则 user_A 和 user_B 用相同 session_id 时 sticky 串号
+        let ua = "claude-cli/2.1.81";
+        let body = json!({
+            "metadata": { "user_id": "{\"session_id\":\"shared-id\"}" }
+        });
+        let h_token1 = generate_session_hash(ua, &body, ClientType::ClaudeCode, Some(1));
+        let h_token2 = generate_session_hash(ua, &body, ClientType::ClaudeCode, Some(2));
+        let h_none = generate_session_hash(ua, &body, ClientType::ClaudeCode, None);
+        assert_ne!(h_token1, h_token2, "ClaudeCode: 不同 token_id 必须独立 sticky");
+        assert_ne!(h_token1, h_none);
+        assert_eq!(h_none, "k0:shared-id");
+        assert_eq!(h_token1, "k1:shared-id");
+
+        // API 模式同样
+        let body2 = json!({ "system": "shared-prompt" });
+        let a = generate_session_hash(ua, &body2, ClientType::API, Some(1));
+        let b = generate_session_hash(ua, &body2, ClientType::API, Some(2));
+        assert_ne!(a, b, "API: 不同 token_id 必须独立 sticky");
     }
 }

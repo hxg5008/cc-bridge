@@ -37,34 +37,115 @@ fn perf_log(rid: &str, phase: &str, elapsed_ms: f64) {
 /// 持有一个并发槽（cache 中的一个计数键），drop 时触发异步释放。
 ///
 /// 通过 `disarm()` 可以在已手动释放时跳过 drop-time 释放，避免双重扣减。
+///
+/// **max_hold 强制释放**: 即使 SlotHolder 没被 drop / 没被 disarm,
+/// 在持有 [`MAX_SLOT_HOLD`] 秒后会自动调 release_slot 一次,
+/// 防止上游卡死时账号并发槽被锁死整整 5 分钟 (修 N4)。
+/// 与 SlotHolder 自己的 release 用 CAS 保证只调一次。
 pub struct SlotHolder {
     cache: Arc<dyn CacheStore>,
     key: String,
-    released: bool,
+    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: std::sync::Arc<tokio::sync::Notify>,
+    /// 链式持有的下一个 slot (修 C1: 支持 token-level concurrency slot 跟
+    /// account-level slot 一起绑生命周期)。Drop 时自动级联释放, 顺序无关。
+    chain: Option<Box<SlotHolder>>,
 }
 
+/// SlotHolder 的最长持有时间 (秒)。超过即视为"上游卡死/客户端断开但 stream 没醒过来"
+/// → 强制释放 slot, 避免账号并发槽被锁死。
+/// 取值理由: read_timeout(180s) + 30s grace = 210s, 上调到 240s 留余量。
+const MAX_SLOT_HOLD: std::time::Duration = std::time::Duration::from_secs(240);
+
 impl SlotHolder {
-    /// 构造一个将在 drop 时释放指定 key 的 holder。
+    /// 构造一个将在 drop / max_hold / disarm 时只释放一次指定 key 的 holder。
     /// 调用者必须保证 `cache.acquire_slot(key, ...)` 已经成功获取。
     pub fn new(cache: Arc<dyn CacheStore>, key: String) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        // 启动 max_hold timer (持有超时强制释放)
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let cache_t = cache.clone();
+            let key_t = key.clone();
+            let released_t = released.clone();
+            let cancel_t = cancel.clone();
+            handle.spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(MAX_SLOT_HOLD) => {
+                        if released_t
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            tracing::warn!(
+                                key = %key_t,
+                                hold_secs = MAX_SLOT_HOLD.as_secs(),
+                                "slot held too long, force releasing (likely upstream stuck or client gone)"
+                            );
+                            cache_t.release_slot(&key_t).await;
+                        }
+                    }
+                    _ = cancel_t.notified() => {
+                        // SlotHolder Drop 或 disarm 已经处理, timer 退出
+                    }
+                }
+            });
+        }
         Self {
             cache,
             key,
-            released: false,
+            released,
+            cancel,
+            chain: None,
         }
     }
 
-    /// 标记为已释放，阻止 Drop 时再次触发 release。
-    pub fn disarm(mut self) {
-        self.released = true;
+    /// 附加另一个 SlotHolder, 让两者绑定相同生命周期 (修 C1):
+    /// 用于 gateway 同时持有 token-level + account-level concurrency slot,
+    /// SSE 流结束/客户端断开时自动同步释放, 互相不会泄漏。
+    pub fn chain_with(mut self, other: SlotHolder) -> Self {
+        // 如果已经 chain 过, 把 new other 接到链尾
+        match &mut self.chain {
+            Some(existing) => {
+                existing.append_to_chain(other);
+            }
+            None => self.chain = Some(Box::new(other)),
+        }
+        self
+    }
+
+    fn append_to_chain(&mut self, tail: SlotHolder) {
+        match &mut self.chain {
+            Some(c) => c.append_to_chain(tail),
+            None => self.chain = Some(Box::new(tail)),
+        }
+    }
+
+    /// 标记为已释放，阻止 Drop 时再次触发 release;
+    /// 同时通知 max_hold timer 退出。
+    /// **注意: 不影响 chain 链上的子 holder, 它们 Drop 时各自正常释放。**
+    pub fn disarm(self) {
+        use std::sync::atomic::Ordering;
+        self.released.store(true, Ordering::Release);
+        self.cancel.notify_one();
+        // self Drop 时 released==true, CAS 失败, 不再 release
+        // chain 子节点会随 self drop 自然走自己的 Drop
     }
 }
 
 impl Drop for SlotHolder {
     fn drop(&mut self) {
-        if self.released {
+        use std::sync::atomic::Ordering;
+        // CAS: false → true; 失败说明 timer 或 disarm 已经处理过, 跳过
+        if self
+            .released
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
+        // 通知 timer 退出 (即使它已经 sleep 完也无害)
+        self.cancel.notify_one();
         let cache = self.cache.clone();
         let key = std::mem::take(&mut self.key);
         // 与旧 scopeguard 一致，使用 tokio::spawn 异步释放（Drop 可能在同步上下文）
@@ -94,6 +175,123 @@ impl<S: Stream> Stream for SlotHeldStream<S> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project().inner.poll_next(cx)
     }
+}
+
+pin_project! {
+    /// 透明嗅探 Anthropic /v1/messages 响应的 message_start 事件，提取 usage 字段累加到 metrics。
+    /// 不修改字节流；仅在前 64KB 内尝试解析一次（message_start 总是在响应最前面）。
+    /// 解析成功或超过 64KB 后不再处理后续 chunk，避免开销。
+    pub struct UsageSnifferStream<S> {
+        #[pin]
+        inner: S,
+        scratch: Vec<u8>,
+        done: bool,
+        account_id: i64,
+    }
+}
+
+impl<S> UsageSnifferStream<S> {
+    pub fn new(inner: S, account_id: i64) -> Self {
+        Self {
+            inner,
+            scratch: Vec::with_capacity(2048),
+            done: false,
+            account_id,
+        }
+    }
+}
+
+/// UsageSnifferStream 的 scratch 缓冲上限。
+/// message_start event 实测通常 <2KB; 保留 32KB 给极端长 system_fingerprint /
+/// initial usage 块留余量, 比旧 64KB 节省一半内存。
+/// 1000 并发 SSE 时: 64KB × 1000 = 64MB → 32KB × 1000 = 32MB
+const SNIFFER_MAX_BYTES: usize = 32 * 1024;
+
+impl<S, E> Stream for UsageSnifferStream<S>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>>,
+{
+    type Item = S::Item;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        let next = this.inner.poll_next(cx);
+        if !*this.done {
+            if let Poll::Ready(Some(Ok(ref bytes))) = next {
+                this.scratch.extend_from_slice(bytes.as_ref());
+                if let Some(snap) = try_parse_anthropic_usage(this.scratch) {
+                    crate::service::metrics::METRICS.record_anthropic_usage(*this.account_id, &snap);
+                    *this.done = true;
+                    *this.scratch = Vec::new();
+                } else if this.scratch.len() > SNIFFER_MAX_BYTES {
+                    *this.done = true;
+                    *this.scratch = Vec::new();
+                }
+            }
+        }
+        next
+    }
+}
+
+/// 在响应字节缓冲里提取 usage 字段，支持两种格式：
+/// 1. SSE 流式：找 `event: message_start` 块，解析其 `data:` 行的 JSON
+/// 2. 非流式：直接 parse 顶层 JSON，找 `message.usage` 或顶层 `usage`
+/// 找不到返回 None。
+fn try_parse_anthropic_usage(buf: &[u8]) -> Option<crate::service::metrics::AnthropicUsageSnapshot> {
+    let s = std::str::from_utf8(buf).ok()?;
+
+    // 尝试 SSE 流式格式
+    if let Some(event_idx) = s.find("event: message_start") {
+        let after_event = &s[event_idx..];
+        if let Some(data_idx) = after_event.find("\ndata:") {
+            let after_data = &after_event[data_idx + 6..];
+            if let Some(line_end) = after_data.find('\n') {
+                let json_text = after_data[..line_end].trim();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_text) {
+                    if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
+                        return Some(parse_usage_object(usage));
+                    }
+                }
+            }
+        }
+    }
+
+    // 尝试非流式：直接 parse 整个 body 为 JSON
+    // 非流式响应顶层就是 message 对象，usage 字段在顶层
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(buf) {
+        if let Some(usage) = v.get("usage") {
+            return Some(parse_usage_object(usage));
+        }
+        // 兜底：万一是包了一层 message
+        if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
+            return Some(parse_usage_object(usage));
+        }
+    }
+
+    None
+}
+
+/// 从 usage JSON 对象提取 4 个 token 计数。
+fn parse_usage_object(usage: &serde_json::Value) -> crate::service::metrics::AnthropicUsageSnapshot {
+    let mut snap = crate::service::metrics::AnthropicUsageSnapshot::default();
+    snap.input_tokens = usage
+        .get("input_tokens")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    snap.cache_read_input_tokens = usage
+        .get("cache_read_input_tokens")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    if let Some(cc) = usage.get("cache_creation").and_then(|c| c.as_object()) {
+        snap.ephemeral_5m_input_tokens = cc
+            .get("ephemeral_5m_input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        snap.ephemeral_1h_input_tokens = cc
+            .get("ephemeral_1h_input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+    }
+    snap
 }
 
 pub struct GatewayService {
@@ -179,9 +377,13 @@ impl GatewayService {
         // 检测客户端类型
         let client_type = detect_client_type(&ua, &body_map);
 
-        // 生成会话哈希
-        let session_hash =
-            crate::service::account::generate_session_hash(&ua, &body_map, client_type);
+        // 生成会话哈希 (修 N3: 加 api_token_id 防止多租户串号)
+        let session_hash = crate::service::account::generate_session_hash(
+            &ua,
+            &body_map,
+            client_type,
+            api_token.map(|t| t.id),
+        );
         cp!("session_hash");
 
         // 根据令牌限制构建账号过滤条件
@@ -241,7 +443,7 @@ impl GatewayService {
             }
         }
 
-        // 获取并发槽位
+        // 获取并发槽位 (account-level)
         let acquired = self
             .account_svc
             .acquire_slot(account.id, account.concurrency)
@@ -256,16 +458,46 @@ impl GatewayService {
 
         // SlotHolder 承载槽位所有权：SlotHeldStream 随 body 流结束/中断才释放；
         // 429 包装时原 resp 被 drop → SlotHolder 也被 drop → 自动释放。
-        let slot = self.account_svc.slot_holder_for(account.id);
+        let mut slot = self.account_svc.slot_holder_for(account.id);
+
+        // 修 C1: 同时 acquire token-level concurrency slot, 防止单个 token
+        // 用 50 个并发请求把所有账号槽吃光 → 其他用户全部 503。
+        // 默认每 token 上限 20 in-flight, 可通过 env CCBRIDGE_TOKEN_CONCURRENCY 调整。
+        // 拿不到 → 立刻 429 + Retry-After (本 token 自己慢, 不影响其他 token)
+        if let Some(token) = api_token {
+            let token_max: i32 = std::env::var("CCBRIDGE_TOKEN_CONCURRENCY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|n: &i32| *n > 0)
+                .unwrap_or(20);
+            let tk_key = format!("tk:{}", token.id);
+            let cache = self.account_svc.cache();
+            // TTL 600s 兜底, 实际由 SlotHolder Drop 触发 release; 跟 account slot ttl 对齐
+            let tk_ok = cache
+                .acquire_slot(&tk_key, token_max, std::time::Duration::from_secs(600))
+                .await
+                .unwrap_or(false);
+            if !tk_ok {
+                // 此时 account slot 已经拿到, slot 走 Drop 自动释放
+                crate::service::metrics::METRICS.record_gateway_rejected("per_token_cap");
+                return Err(AppError::TooManyRequests(format!(
+                    "per-token concurrency limit ({}) reached, please retry",
+                    token_max
+                )));
+            }
+            // 把 token slot 链到 account slot 上, 一起绑 SSE 流生命周期
+            let token_holder = SlotHolder::new(cache.clone(), tk_key);
+            slot = slot.chain_with(token_holder);
+        }
 
         // 改写请求体
         debug!(
             "request body BEFORE rewrite: {}",
             truncate_body(&body_bytes, 4096)
         );
-        let rewritten_body =
-            self.rewriter
-                .rewrite_body(&body_bytes, &path, &account, client_type);
+        let rewritten_body = self
+            .rewriter
+            .rewrite_body(&body_bytes, &path, &account, client_type)?;
         debug!(
             "request body AFTER rewrite: {}",
             truncate_body(&rewritten_body, 4096)
@@ -312,6 +544,14 @@ impl GatewayService {
         cp!("forward_done");
 
         let status = resp.status();
+
+        // 修 C6: per-account circuit breaker — 5xx 累计 / 2xx 重置
+        // (4xx/429 不算"上游故障", 不计入)
+        if status.is_server_error() {
+            self.limit_store.record_upstream_5xx(account.id);
+        } else if status.is_success() {
+            self.limit_store.record_upstream_success(account.id);
+        }
 
         // 5xx 黏性透传：wrap body 为通用 api_error，剥离请求追踪头。
         // 避免把上游堆栈 / 请求 ID / 基础设施信息泄漏给下游客户端。
@@ -383,9 +623,20 @@ impl GatewayService {
         };
 
         for (k, v) in headers {
-            debug!("upstream header: {}: {}", k, v);
+            // 敏感 header 在 debug 日志里脱敏 (防 LOG_LEVEL=debug 时 Bearer / cookie 落盘)
+            if is_sensitive_log_header(k.as_str()) {
+                debug!("upstream header: {}: ***", k);
+            } else {
+                debug!("upstream header: {}: {}", k, v);
+            }
+            // accept-encoding 改 identity，让上游响应不压缩，UsageSnifferStream 能解析 usage 字段。
+            // 代价：响应 body 不再压缩，客户端拿到明文（带宽消耗略增，但 metrics 嗅探需要）。
+            if k.eq_ignore_ascii_case("accept-encoding") {
+                continue;
+            }
             req_builder = req_builder.header(k, v);
         }
+        req_builder = req_builder.header("accept-encoding", "identity");
         req_builder = req_builder.header("Host", "api.anthropic.com");
         req_builder = req_builder.body(body.to_vec());
         perf_log(rid, "forward_prep", tls_t0.elapsed().as_secs_f64() * 1000.0);
@@ -421,10 +672,10 @@ impl GatewayService {
         if should_flush {
             let ls = self.limit_store.clone();
             let aid = account.id;
+            // 用 try_flush_to_db 而非 flush_to_db: per-account 互斥 + 全局 semaphore(8)
+            // 防止 burst 429 把 DB pool 打满
             tokio::spawn(async move {
-                if let Err(e) = ls.flush_to_db(aid).await {
-                    warn!("limit flush failed for account {}: {}", aid, e);
-                }
+                ls.try_flush_to_db(aid).await;
             });
         }
         perf_log(rid, "absorb_headers", absorb_t0.elapsed().as_secs_f64() * 1000.0);
@@ -444,8 +695,10 @@ impl GatewayService {
 
         // 流式传输响应体，并把 SlotHolder 搭载到 body 流上：
         // 只有 body 被读完、或客户端提前断开（axum drop body）时，槽位才会释放。
+        // UsageSnifferStream 在外层透明嗅探 message_start 事件，不影响下游。
         let body_stream = resp.bytes_stream();
-        let held_stream = SlotHeldStream::new(body_stream, slot);
+        let sniffed_stream = UsageSnifferStream::new(body_stream, account.id);
+        let held_stream = SlotHeldStream::new(sniffed_stream, slot);
         let body = Body::from_stream(held_stream);
 
         response_builder
@@ -479,6 +732,25 @@ const GATEWAY_HEADER_PREFIXES: &[&str] = &[
 fn is_gateway_fingerprint_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     GATEWAY_HEADER_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
+/// 在 debug 日志里需要脱敏的 header 名 (防止运维把 LOG_LEVEL 调 debug 时
+/// 把上游 Bearer / cookie / x-api-key 等凭证落盘)。
+fn is_sensitive_log_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "authorization"
+            | "x-api-key"
+            | "x-anthropic-api-key"
+            | "cookie"
+            | "set-cookie"
+            | "proxy-authorization"
+            | "x-csrf-token"
+            | "session-key"
+            | "x-session-key"
+            | "anthropic-beta"
+    )
 }
 
 /// 黏性透传策略下，把上游 429 响应包装成 Anthropic 标准格式的通用文案，

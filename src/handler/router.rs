@@ -20,6 +20,7 @@ use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
 use crate::service::openai_oauth::OpenAIOAuthService;
 use crate::service::telemetry::TelemetryService;
+use crate::store::cache::CacheStore;
 use crate::store::token_store::TokenStore;
 
 #[derive(Clone)]
@@ -32,6 +33,8 @@ pub struct AppState {
     pub openai_oauth_svc: Arc<OpenAIOAuthService>,
     pub telemetry_svc: Arc<TelemetryService>,
     pub admin_password: String,
+    /// readyz 用 cache.ping() 验证 Redis 连通; 也可未来给其它 handler 用
+    pub cache: Arc<dyn CacheStore>,
 }
 
 pub fn build_router(
@@ -43,6 +46,7 @@ pub fn build_router(
     oauth_flow_svc: Arc<OAuthFlowService>,
     openai_oauth_svc: Arc<OpenAIOAuthService>,
     telemetry_svc: Arc<TelemetryService>,
+    cache: Arc<dyn CacheStore>,
 ) -> Router {
     let state = AppState {
         gateway_svc,
@@ -53,6 +57,7 @@ pub fn build_router(
         openai_oauth_svc,
         telemetry_svc,
         admin_password: cfg.admin.password.clone(),
+        cache,
     };
 
     let admin_password = state.admin_password.clone();
@@ -61,7 +66,8 @@ pub fn build_router(
     let frontend_routes = Router::new()
         .route("/", get(spa_handler))
         .route("/login", get(spa_handler))
-        .route("/tokens", get(spa_handler));
+        .route("/tokens", get(spa_handler))
+        .route("/cache-stats", get(spa_handler));
 
     // 前端静态资源
     let asset_routes = Router::new()
@@ -69,10 +75,11 @@ pub fn build_router(
         .route("/favicon.svg", get(asset_handler));
 
     // 健康检查端点 (公开, 无需鉴权; 容器编排 / 反代探活用)
+    // /metrics 已从这里挪走 → 改挂在 admin 路由下需要密码,
+    // 防止外网扫到端口的人拿走运营敏感指标 (账号 token/请求量/失败率)
     let health_routes = Router::new()
         .route("/livez", get(livez_handler))
         .route("/readyz", get(readyz_handler))
-        .route("/metrics", get(metrics_handler))
         .with_state(state.clone());
 
     // 管理 API（密码认证，完整路径注册）
@@ -87,6 +94,10 @@ pub fn build_router(
         .route("/admin/accounts/:id/usage", post(refresh_usage))
         .route("/admin/accounts/refresh-all-usage", post(refresh_all_usage))
         .route("/admin/accounts/:id/clear_limit", post(clear_limit_state))
+        .route("/admin/cache-stats", get(cache_stats))
+        // metrics 端点暴露每账号 token / 请求量 / cache 命中等运营敏感数据,
+        // 必须鉴权; prometheus scrape 时配 admin 密码到 basic_auth 即可
+        .route("/admin/metrics", get(metrics_handler))
         .route("/admin/tokens", get(list_tokens).post(create_token))
         .route(
             "/admin/tokens/:id",
@@ -146,6 +157,37 @@ pub fn build_router(
         }))
         .with_state(state.clone());
 
+    // CORS: admin API 跨域调用 (浏览器从其他域名打开 admin 面板) 需要;
+    // gateway 透传路径不需要 (claude-code 是 native 客户端不走浏览器)。
+    // 用宽松策略 (允许任何 origin/header), 安全性靠 admin password 保证。
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
+
+    // 全局 in-flight 请求 cap (修 C2): 防 OOM / runtime 打爆。
+    // 计算公式: SSE 长连基线 (200/实例) + 短请求峰值缓冲 (~800) ≈ 1000;
+    // 可通过环境变量 `CCBRIDGE_GLOBAL_INFLIGHT_CAP` 调整 (压测后改)。
+    // 超过 cap 的请求 立刻返 503 "service overloaded", 不堆积 tokio task。
+    let global_cap: usize = std::env::var("CCBRIDGE_GLOBAL_INFLIGHT_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1000);
+    tracing::info!("global in-flight cap: {} concurrent requests", global_cap);
+    let global_sem = Arc::new(tokio::sync::Semaphore::new(global_cap));
+
+    // 单请求 body 上限 (修 C2): 默认 2MB 防大 body 撑爆内存。
+    // /v1/messages 实际最大约 100-200KB (system + messages 文本), 2MB 极保守。
+    // SessionKey 批量导入 / OAuth 等长 body 请求由各 handler 自己用 to_bytes(10MB) 二次校验。
+    let body_limit_bytes: usize = std::env::var("CCBRIDGE_BODY_LIMIT_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2)
+        * 1024
+        * 1024;
+
     // 组合路由：前端 + 管理 API + 其余全部透传网关
     Router::new()
         .merge(frontend_routes)
@@ -153,7 +195,51 @@ pub fn build_router(
         .merge(health_routes)
         .merge(admin_routes)
         .fallback(gateway_fallback)
+        // body size 限制 (单请求最大字节数, 防大 body 撑爆内存)
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit_bytes))
+        // 全局并发 cap: 超 N 个 in-flight 请求立刻 503, 不让 tokio worker 堆积
+        .layer(middleware::from_fn(move |req, next: Next| {
+            let sem = global_sem.clone();
+            global_concurrency_middleware(sem, req, next)
+        }))
+        // CORS (admin 跨域支持)
+        .layer(cors)
         .with_state(state)
+}
+
+/// 全局并发限流 middleware (修 C2): 用 Semaphore::try_acquire 立刻判断,
+/// 拿不到 permit 直接 503 + Retry-After=1s, 不阻塞 tokio worker。
+async fn global_concurrency_middleware(
+    sem: Arc<tokio::sync::Semaphore>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let permit = match sem.try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            // 容量打满: 立刻 503, 不排队
+            crate::service::metrics::METRICS.record_gateway_rejected("global_cap");
+            tracing::warn!(
+                "global in-flight cap reached, shedding request to {}",
+                req.uri().path()
+            );
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({
+                    "error": "service overloaded, please retry shortly",
+                    "type": "capacity_exceeded"
+                })),
+            )
+                .into_response();
+            if let Ok(v) = "1".parse() {
+                resp.headers_mut().insert("retry-after", v);
+            }
+            return resp;
+        }
+    };
+    let resp = next.run(req).await;
+    drop(permit); // 显式释放; 实际 owned permit 在 drop 自动 release
+    resp
 }
 
 // --- Handlers ---
@@ -464,6 +550,30 @@ async fn openai_chat_completions_inner(
             );
         }
 
+        // 修 N10: OpenAI 路径 401/403 凭证失效 → 主动 disable_account, 让 dashboard
+        // 看见挂掉的号; 不再让 selector 一直选这个号死循环 + cooldown 60s 然后又选。
+        // (4xx 中 451 = legal blocked 也归 disable; 429 是限流不是失效, 走另一分支)
+        if matches!(status.as_u16(), 401 | 403 | 451) {
+            tracing::warn!(
+                "openai account {} returned {} → disabling account",
+                account.id,
+                status.as_u16()
+            );
+            let svc = state.account_svc.clone();
+            let acc_id = account.id;
+            let reason = format!("openai upstream {} (auth/legal)", status.as_u16());
+            tokio::spawn(async move {
+                let _ = svc
+                    .disable_account(
+                        acc_id,
+                        crate::model::account::AccountStatus::Disabled,
+                        &reason,
+                        None,
+                    )
+                    .await;
+            });
+        }
+
         // 5xx 失败转移: 标短期冷却 + 把当前账号加 exclude, 再选一次
         let is_5xx = (500..600).contains(&status.as_u16());
         if is_5xx && attempt < MAX_ATTEMPTS {
@@ -633,6 +743,7 @@ struct CreateAccountRequest {
     priority: Option<i32>,
     auto_telemetry: Option<bool>,
     experimental_reveal_thinking: Option<bool>,
+    enable_cache_ttl_1h_injection: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -648,6 +759,16 @@ async fn create_account(
 ) -> Result<(StatusCode, Json<Account>), AppError> {
     if req.email.is_empty() {
         return Err(AppError::BadRequest("email is required".into()));
+    }
+    // 防御性校验：rewrite 模式破坏缓存命中（cch_hash 注入到 system 块导致前缀漂移）
+    if let Some(ref bm) = req.billing_mode {
+        if bm == "rewrite" && std::env::var("CCBRIDGE_ALLOW_REWRITE").is_err() {
+            return Err(AppError::BadRequest(
+                "billing_mode='rewrite' is disabled because it breaks Anthropic prompt cache hit rate (cch_hash drifts system prefix). \
+                 Set env CCBRIDGE_ALLOW_REWRITE=1 if Anthropic anti-fingerprint requires it."
+                    .into(),
+            ));
+        }
     }
     let auth_type = req.auth_type.unwrap_or_else(|| "setup_token".into()).into();
     let setup_token = req.setup_token.or(req.token).unwrap_or_default();
@@ -680,6 +801,8 @@ async fn create_account(
         auto_telemetry: req.auto_telemetry.unwrap_or(false),
         telemetry_count: 0,
         experimental_reveal_thinking: req.experimental_reveal_thinking.unwrap_or(false),
+        enable_cache_ttl_1h_injection: req.enable_cache_ttl_1h_injection.unwrap_or(false),
+        session_key: String::new(),
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         platform: "claude".into(),
@@ -771,6 +894,14 @@ async fn update_account(
     }
     if let Some(billing_mode) = updates.get("billing_mode").and_then(|v| v.as_str()) {
         if !billing_mode.is_empty() {
+            // 防御性校验：rewrite 模式破坏缓存命中
+            if billing_mode == "rewrite" && std::env::var("CCBRIDGE_ALLOW_REWRITE").is_err() {
+                return Err(AppError::BadRequest(
+                    "billing_mode='rewrite' is disabled because it breaks Anthropic prompt cache hit rate (cch_hash drifts system prefix). \
+                     Set env CCBRIDGE_ALLOW_REWRITE=1 if Anthropic anti-fingerprint requires it."
+                        .into(),
+                ));
+            }
             existing.billing_mode = billing_mode.to_string().into();
         }
     }
@@ -800,6 +931,16 @@ async fn update_account(
         .and_then(|v| v.as_bool())
     {
         existing.experimental_reveal_thinking = reveal;
+    }
+    if let Some(inject) = updates
+        .get("enable_cache_ttl_1h_injection")
+        .and_then(|v| v.as_bool())
+    {
+        existing.enable_cache_ttl_1h_injection = inject;
+    }
+    if let Some(sk) = updates.get("session_key").and_then(|v| v.as_str()) {
+        // session_key 可以更新（包括清空）；明文存储，运维需保护 DB 访问权限
+        existing.session_key = sk.to_string();
     }
 
     // OpenAI 平台专用字段 partial merge 到 extra (chatgpt_account_id / organization_id / base_url 等)
@@ -1006,7 +1147,15 @@ async fn test_account(
         .test_token(&token, &account.proxy_url, &account.canonical_env)
         .await
     {
-        Ok(()) => Ok(Json(serde_json::json!({"status": "ok"}))),
+        Ok(()) => {
+            // test 成功 = 上游真的能用 = LimitStore 里如果还残留 rejected 就是假阳性，自动清。
+            // 这是给运维一个"人工拨"的逃生口：怀疑账号被卡住时，点测试按钮即可恢复。
+            let cleared = state.account_svc.clear_limit_runtime_flags(id);
+            Ok(Json(serde_json::json!({
+                "status": "ok",
+                "auto_cleared_limit": cleared,
+            })))
+        }
         Err(e) => Ok(Json(
             serde_json::json!({"status": "error", "message": e.to_string()}),
         )),
@@ -1098,6 +1247,92 @@ async fn clear_limit_state(
     Ok(Json(serde_json::json!({
         "status": "ok",
         "cleared": cleared,
+    })))
+}
+
+/// GET /admin/cache-stats — 总体缓存命中率统计 + 按账号明细。
+/// 数据来自启动至今的 atomic counter（重启清零，但 Prometheus 风格 counter 即可）。
+/// 用于前端首页 Dashboard 展示，不需要任何额外存储或聚合。
+async fn cache_stats(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use std::sync::atomic::Ordering;
+    let m = &crate::service::metrics::METRICS;
+    let input = m.anthropic_input_tokens_total.load(Ordering::Relaxed);
+    let read = m.anthropic_cache_read_tokens_total.load(Ordering::Relaxed);
+    let c5m = m.anthropic_cache_creation_5m_tokens_total.load(Ordering::Relaxed);
+    let c1h = m.anthropic_cache_creation_1h_tokens_total.load(Ordering::Relaxed);
+    let sniffed = m.anthropic_usage_sniffed_total.load(Ordering::Relaxed);
+
+    let total = input + read + c5m + c1h;
+    let hit_rate_pct = if total > 0 {
+        (read as f64) / (total as f64) * 100.0
+    } else {
+        0.0
+    };
+    let one_hour_share_pct = if c5m + c1h > 0 {
+        (c1h as f64) / ((c5m + c1h) as f64) * 100.0
+    } else {
+        0.0
+    };
+    // 实际加权 vs 假设全 1.0 倍率消耗
+    let weighted =
+        input as f64 + (c5m as f64) * 1.25 + (c1h as f64) * 2.0 + (read as f64) * 0.1;
+    let saved_pct = if total > 0 {
+        (1.0 - weighted / (total as f64)) * 100.0
+    } else {
+        0.0
+    };
+
+    let preserved = m.sticky_preserved_total.load(Ordering::Relaxed);
+    let evicted = m.sticky_evicted_total.load(Ordering::Relaxed);
+    let recovery_ok = m.oauth_recovery_session_key_success.load(Ordering::Relaxed);
+    let recovery_fail = m.oauth_recovery_session_key_failure.load(Ordering::Relaxed);
+
+    // 按账号明细：捞出所有 per-account snapshot + 拼接 email（用 admin API 已有的 list_paged 不够，直接查 DB）
+    let mut per_account = m.snapshot_per_account_cache();
+    // 按命中 token 量降序排列
+    per_account.sort_by_key(|s| std::cmp::Reverse(s.cache_read_tokens));
+
+    // 拼接 account email（从 schedulable cache 或 DB 找）
+    let accounts_meta = state.account_svc.list_accounts().await.unwrap_or_default();
+    let email_map: std::collections::HashMap<i64, String> = accounts_meta
+        .iter()
+        .map(|a| (a.id, a.email.clone()))
+        .collect();
+    let per_account_with_email: Vec<serde_json::Value> = per_account
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "account_id": s.account_id,
+                "account_email": email_map.get(&s.account_id).cloned().unwrap_or_default(),
+                "input_tokens": s.input_tokens,
+                "cache_read_tokens": s.cache_read_tokens,
+                "cache_creation_5m_tokens": s.cache_creation_5m_tokens,
+                "cache_creation_1h_tokens": s.cache_creation_1h_tokens,
+                "sniffed_requests": s.sniffed_requests,
+                "total_tokens": s.total_tokens,
+                "hit_rate_pct": s.hit_rate_pct,
+                "one_hour_share_pct": s.one_hour_share_pct,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "sniffed_requests": sniffed,
+        "input_tokens": input,
+        "cache_read_tokens": read,
+        "cache_creation_5m_tokens": c5m,
+        "cache_creation_1h_tokens": c1h,
+        "total_tokens": total,
+        "hit_rate_pct": hit_rate_pct,
+        "one_hour_share_pct": one_hour_share_pct,
+        "saved_pct": saved_pct,
+        "sticky_preserved_total": preserved,
+        "sticky_evicted_total": evicted,
+        "oauth_recovery_success": recovery_ok,
+        "oauth_recovery_failure": recovery_fail,
+        "per_account": per_account_with_email,
     })))
 }
 
@@ -1314,6 +1549,10 @@ struct CookieAuthCreateRequest {
     auto_telemetry: Option<bool>,
     #[serde(default)]
     subscription_type: Option<String>,
+    /// 1h cache TTL 注入：默认开启（None 时按 true 处理，最大化缓存命中率）。
+    /// 显式传 false 可关闭。
+    #[serde(default)]
+    enable_cache_ttl_1h_injection: Option<bool>,
 }
 
 async fn build_account_from_cookie_auth(
@@ -1375,7 +1614,18 @@ async fn build_account_from_cookie_auth(
         } else {
             Some(token.organization_uuid)
         },
-        subscription_type: req.subscription_type.clone(),
+        // 优先用前端显式传入的 subscription_type, 否则用 OAuth 自动检测的档位
+        subscription_type: req
+            .subscription_type
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                if token.subscription_type.is_empty() {
+                    None
+                } else {
+                    Some(token.subscription_type.clone())
+                }
+            }),
         concurrency: req.concurrency.unwrap_or(3),
         priority: req.priority.unwrap_or(50),
         rate_limited_at: None,
@@ -1384,6 +1634,8 @@ async fn build_account_from_cookie_auth(
         auto_telemetry: req.auto_telemetry.unwrap_or(false),
         telemetry_count: 0,
         experimental_reveal_thinking: false,
+        enable_cache_ttl_1h_injection: req.enable_cache_ttl_1h_injection.unwrap_or(true),
+        session_key: req.session_key.clone(),
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         platform: "claude".into(),
@@ -1424,6 +1676,10 @@ struct CookieAuthCreateBatchRequest {
     auto_telemetry: Option<bool>,
     #[serde(default)]
     subscription_type: Option<String>,
+    /// 批量导入时所有账号默认是否开启 1h cache TTL 注入。
+    /// None → 默认 true（最大化缓存命中率）。显式传 false 可关闭。
+    #[serde(default)]
+    enable_cache_ttl_1h_injection: Option<bool>,
 }
 
 #[derive(serde::Serialize)]
@@ -1483,6 +1739,7 @@ async fn oauth_cookie_auth_create_batch(
             billing_mode: req.billing_mode.clone(),
             auto_telemetry: req.auto_telemetry,
             subscription_type: req.subscription_type.clone(),
+            enable_cache_ttl_1h_injection: req.enable_cache_ttl_1h_injection,
         };
         joins.spawn(async move {
             let _permit = sem.acquire_owned().await.ok();
@@ -1649,6 +1906,8 @@ async fn create_openai_account(
         auto_telemetry: false,
         telemetry_count: 0,
         experimental_reveal_thinking: false,
+        enable_cache_ttl_1h_injection: false,
+        session_key: String::new(),
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         platform: "openai".into(),
@@ -1959,6 +2218,8 @@ async fn build_openai_account_from_rt(
         auto_telemetry: false,
         telemetry_count: 0,
         experimental_reveal_thinking: false,
+        enable_cache_ttl_1h_injection: false,
+        session_key: String::new(),
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         platform: "openai".into(),
@@ -2133,14 +2394,14 @@ async fn livez_handler() -> Response {
 
 /// `/readyz` — 是否准备好接业务流量。需要 DB ping 通过。
 async fn readyz_handler(State(state): State<AppState>) -> Response {
-    match state.account_svc.ping_db().await {
-        Ok(_) => (StatusCode::OK, "ready").into_response(),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("db: {}", e),
-        )
-            .into_response(),
+    // 同时 ping DB 和 cache; 任一不通就报 503, 让 LB 把流量切走
+    if let Err(e) = state.account_svc.ping_db().await {
+        return (StatusCode::SERVICE_UNAVAILABLE, format!("db: {}", e)).into_response();
     }
+    if let Err(e) = state.cache.ping().await {
+        return (StatusCode::SERVICE_UNAVAILABLE, format!("cache: {}", e)).into_response();
+    }
+    (StatusCode::OK, "ready").into_response()
 }
 
 /// `/metrics` — Prometheus 文本格式指标暴露。

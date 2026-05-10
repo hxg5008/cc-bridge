@@ -157,6 +157,8 @@ mod tests {
             auto_telemetry: false,
             telemetry_count: 0,
             experimental_reveal_thinking: false,
+            enable_cache_ttl_1h_injection: false,
+            session_key: String::new(),
             usage_data: json!({}),
             usage_fetched_at: None,
             platform: "openai".into(),

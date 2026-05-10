@@ -424,25 +424,50 @@ impl Rewriter {
     // --- Body 改写 ---
 
     /// 根据端点和客户端类型改写请求体。
+    ///
+    /// 修 R1: 旧版 JSON 解析失败 silent 返回原 body, 导致改写链整体跳过 →
+    ///   - `model` 字段保留 [1m] 后缀 → Anthropic 直接 400
+    ///   - system prompt 没改 → 真实客户端身份暴露给上游
+    ///   - cache_control 没注入 → 浪费上游配额
+    /// 商用必须返 Err 让 gateway 返 400 给客户端,清楚告知 body 必须是有效 JSON。
+    /// 空 body 仍允许 (有些 GET-like 路径合法)。
     pub fn rewrite_body(
         &self,
         body: &[u8],
         path: &str,
         account: &Account,
         client_type: ClientType,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, crate::error::AppError> {
         if body.is_empty() {
-            return body.to_vec();
+            return Ok(body.to_vec());
         }
 
         let mut parsed: serde_json::Value = match serde_json::from_slice(body) {
             Ok(v) => v,
-            Err(_) => return body.to_vec(), // 非 JSON，直接透传
+            Err(e) => {
+                tracing::warn!(
+                    path = %path,
+                    body_len = body.len(),
+                    "rewrite_body: refusing non-JSON body — possible content-encoding mismatch \
+                     (gzip/brotli upstream of gateway?) or wrong content-type. error: {}",
+                    e
+                );
+                return Err(crate::error::AppError::BadRequest(format!(
+                    "request body must be valid JSON (parse error: {})",
+                    e
+                )));
+            }
         };
 
         if path.starts_with("/v1/messages") {
             strip_empty_text_blocks(&mut parsed);
             self.rewrite_messages(&mut parsed, account, client_type);
+            // 1h cache TTL 注入：开关打开时，把请求体中已存在的 ephemeral cache_control
+            // 块的 ttl 强制改写为 "1h"。仅修改已有断点，不新增。
+            // 必须放在 compute_cch_attestation 之前，因为 cch 是对最终 body 的 xxhash64 签名。
+            if account.enable_cache_ttl_1h_injection {
+                force_cache_control_ttl_1h(&mut parsed);
+            }
         } else if path.contains("/event_logging/batch") {
             self.rewrite_event_batch(&mut parsed, account);
         } else if path.starts_with("/api/eval/") {
@@ -458,7 +483,7 @@ impl Rewriter {
             output = compute_cch_attestation(output);
         }
 
-        output
+        Ok(output)
     }
 
     /// 处理 /v1/messages 请求体。
@@ -1253,6 +1278,52 @@ fn strip_cache_control(body: &mut serde_json::Value) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// 强制把已存在的 ephemeral cache_control 块的 ttl 设为 1h。
+/// 仅修改已经存在的 cache_control，不新增缓存断点。
+/// 移植自 sub2api v0.1.121。受 account.enable_cache_ttl_1h_injection 控制。
+fn force_cache_control_ttl_1h(body: &mut serde_json::Value) {
+    fn touch(block: &mut serde_json::Value) {
+        let Some(obj) = block.as_object_mut() else {
+            return;
+        };
+        let Some(cc) = obj.get_mut("cache_control") else {
+            return;
+        };
+        let Some(cc_obj) = cc.as_object_mut() else {
+            return;
+        };
+        if cc_obj.get("type").and_then(|t| t.as_str()) != Some("ephemeral") {
+            return;
+        }
+        cc_obj.insert("ttl".into(), serde_json::Value::String("1h".into()));
+    }
+
+    // system 数组
+    if let Some(arr) = body.get_mut("system").and_then(|s| s.as_array_mut()) {
+        for item in arr.iter_mut() {
+            touch(item);
+        }
+    }
+
+    // messages[].content[]
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages.iter_mut() {
+            if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                for item in content.iter_mut() {
+                    touch(item);
+                }
+            }
+        }
+    }
+
+    // tools 数组
+    if let Some(arr) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for item in arr.iter_mut() {
+            touch(item);
         }
     }
 }

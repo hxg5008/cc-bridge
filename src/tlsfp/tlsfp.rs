@@ -323,26 +323,81 @@ fn build_tls_config() -> rustls::ClientConfig {
 
 /// 上游读取 idle 超时：两次 body 数据帧之间最多等这么久。
 /// - 流式 SSE：每来一个事件就重置，只要还在持续吐 event 就不会被切
-/// - 非流式：headers 到后 body 若 300s 内一个字节都没来视为上游卡死
-/// 与旧版 `.timeout(300)`（完整生命周期硬顶）的区别：不再因流持续时间长而误切
-const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// - 非流式：headers 到后 body 若该秒数内一个字节都没来视为上游卡死
+///
+/// 180s 是经验取值: Anthropic SSE event 间隔通常 < 30s; 1h cache 命中的
+/// 大请求最长见过 60-90s 之间无 chunk; 180s 给 1h 缓存场景留 2 倍冗余,
+/// 同时上游真卡死时 3 分钟内主动切, 不会让客户端 + slot 被锁死 5 分钟。
+/// 比旧值 300s 缩短 40%, 显著降低慢上游带来的 slot 雪崩风险。
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 全局 reqwest::Client 缓存, 按 (proxy_url, read_timeout_millis) 分桶。
+///
+/// 为什么要缓存：
+///   `reqwest::Client` 内部维护 keep-alive 连接池 + TLS 会话缓存,
+///   每次新建意味着抛弃所有空闲连接 + 每个请求都做完整 TCP+TLS 握手
+///   (api.anthropic.com 边缘节点单次握手 200-500ms)。
+///   高并发场景下握手开销直接拉爆 p99 延迟, 同时高频 TLS 握手会被
+///   上游边缘节点限速。
+///
+/// 缓存策略：
+///   - key = (proxy_url, read_timeout_millis)
+///   - 用 millis 而非 secs: 测试经常用毫秒级 timeout, 用 secs 会让多个
+///     不同毫秒值都映射到 0 → 串 client → 错误超时
+///   - 实际 proxy_url 数量极少 (一般 1-3 个), read_timeout 也是常量,
+///     所以 cache 总条目通常 <10
+///   - 永不淘汰 (Client 内部连接池有自己的 idle timeout)
+static CLIENT_CACHE: once_cell::sync::Lazy<
+    std::sync::RwLock<std::collections::HashMap<(String, u128), reqwest::Client>>,
+> = once_cell::sync::Lazy::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
 /// 创建带 TLS 指纹伪装的 reqwest 客户端。
 /// 支持直连和代理（HTTP/SOCKS5）。
+///
+/// 复用全局缓存：相同 (proxy_url, default-timeout) 的客户端只构造一次,
+/// 后续请求复用 Client 内部连接池。
 pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
     make_request_client_with_read_timeout(proxy_url, UPSTREAM_READ_TIMEOUT)
 }
 
 /// 内部构造函数：暴露 read_timeout 参数给测试用短值验证 idle 语义。
+/// 命中缓存直接返回; miss 才构造 + 入缓存。
 fn make_request_client_with_read_timeout(
     proxy_url: &str,
     read_timeout: Duration,
 ) -> reqwest::Client {
+    let key = (proxy_url.to_string(), read_timeout.as_millis());
+    // fast path: read lock 命中直接返回
+    if let Some(c) = CLIENT_CACHE.read().ok().and_then(|m| m.get(&key).cloned()) {
+        return c;
+    }
+    // slow path: write lock 双检 + 构造 + 插入
+    let mut w = match CLIENT_CACHE.write() {
+        Ok(g) => g,
+        Err(_) => return build_request_client(proxy_url, read_timeout),
+    };
+    if let Some(c) = w.get(&key).cloned() {
+        return c;
+    }
+    let client = build_request_client(proxy_url, read_timeout);
+    w.insert(key, client.clone());
+    client
+}
+
+/// 真正构造 reqwest::Client (无缓存语义)。
+fn build_request_client(proxy_url: &str, read_timeout: Duration) -> reqwest::Client {
     let tls_config = build_tls_config();
 
     let mut builder = reqwest::Client::builder()
         .use_preconfigured_tls(tls_config)
         .read_timeout(read_timeout)
+        // 长连接池配置: 每 host 保留 64 个 idle 连接, 90s 内复用免握手
+        .pool_max_idle_per_host(64)
+        .pool_idle_timeout(Duration::from_secs(90))
+        // TCP 握手 10s 内必须完成, 否则切别的号
+        .connect_timeout(Duration::from_secs(10))
+        // TCP keepalive: 每 30s 一次, 防 NAT/防火墙清理空闲连接
+        .tcp_keepalive(Duration::from_secs(30))
         .no_proxy();
 
     if !proxy_url.is_empty() {

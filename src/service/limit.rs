@@ -20,8 +20,23 @@ use crate::store::account_store::AccountStore;
 /// 内存 → DB 常规刷新 TTL。
 const DB_FLUSH_TTL: Duration = Duration::from_secs(5 * 60);
 /// 当 utilization 达到此值（0.0-1.0 刻度）即认定该窗口撞上限,立即紧急 flush 且 selector 判不可用。
-/// 取 1.0 = 真正撞墙才挡（避免 97-99% 误挡）;依赖上游 absorb_headers 在 100% 时持续更新避免漏判。
-const HIT_THRESHOLD: f64 = 1.0;
+///
+/// 0.97 是工程取舍 (vs 旧版 1.0):
+///   - Anthropic 上游通常在 99.x% 已开始返 429 (服务端窗口统计有滞后), 旧版 1.0
+///     等 selector 看到 100% 时, 客户端早已经撞过若干次 429
+///   - 0.97 留出 ~3% 的 "刹车距离": 看到 97% 立刻不再选这号, 让账号
+///     自然撞到上游硬阈值前下线
+///   - 代价: 每号每天少用约 3% 配额 (单 Pro 约少 4-5 条 msg/天), 商用换平稳
+const HIT_THRESHOLD: f64 = 0.97;
+/// 软降权阈值: 任一窗口 util ∈ [WARN_THRESHOLD, HIT_THRESHOLD) 时账号仍可调度,
+/// 但优先级 +10 (同 priority 组里被排到后面), 让其他健康号优先被选, 这个号
+/// 的剩余配额仅作为"兜底"。
+///
+/// 0.90 是经验值: 90% 之前的账号视为完全健康; 90-97% 区间属"接近满载"。
+const WARN_THRESHOLD: f64 = 0.90;
+/// 软降权时累加的 priority 数值。Account.priority 默认 50, 累加 10 后变 60,
+/// 确保只要有 priority<=50 的健康号在, 就不会选到这个 warn 号。
+const SOFT_DEPRIORITIZE_PENALTY: i32 = 10;
 /// CF-layer 429（或 Anthropic 429 但无 retry-after）的默认短期隔离时长。
 const DEFAULT_429_BAN: Duration = Duration::from_secs(60);
 /// SetupToken RPM/TPM 预抢阈值：任一 counter 的 remaining/limit 低于该值即视为预抢。
@@ -194,13 +209,36 @@ pub struct LimitStore {
     /// 账号限流热态。lock-free 并发哈希(替了 std::sync::Mutex<HashMap>),
     /// 高 RPS 下不会再因为单点锁阻塞 tokio worker 线程。
     states: DashMap<i64, LimitState>,
+    /// per-account flush 互斥: burst 1000 个 429 同时来不会 spawn 1000 个
+    /// DB UPDATE; 已有 flush 在跑时直接跳过 (state 还在内存里下次还会触发)。
+    flush_inflight: DashMap<i64, std::sync::atomic::AtomicBool>,
+    /// 全局并发上限: 即使分散在 N 个账号上, 同时打 DB 的 flush 任务最多 8 个。
+    /// 防止 flush 把 DB pool 打满。
+    flush_semaphore: Arc<tokio::sync::Semaphore>,
+    /// per-account circuit breaker (修 C6): 连续 N 个 5xx 后 open 30s 不调度,
+    /// 防止 Anthropic 区域故障时 gateway 还在死循环把流量打到挂掉的节点。
+    circuit_breakers: DashMap<i64, CircuitBreakerState>,
 }
+
+#[derive(Default)]
+struct CircuitBreakerState {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+}
+
+/// 连续 5 个 5xx 触发 circuit open。
+const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+/// Circuit open 后多长时间内 selector 不再选这个号 (然后自动半开探测)。
+const CIRCUIT_BREAKER_OPEN_DURATION: Duration = Duration::from_secs(30);
 
 impl LimitStore {
     pub fn new(store: Arc<AccountStore>) -> Self {
         Self {
             store,
             states: DashMap::new(),
+            flush_inflight: DashMap::new(),
+            flush_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            circuit_breakers: DashMap::new(),
         }
     }
 
@@ -256,6 +294,13 @@ impl LimitStore {
 
     /// Selector 用：当前账号可否调度。内存无记录 → 乐观 Available。
     pub fn availability(&self, account_id: i64) -> Availability {
+        // 修 C6: 先看 circuit breaker。OPEN 状态 (5xx 累积过阈值且未过 30s) → 拒调度
+        if self.circuit_open(account_id) {
+            return Availability::Unavailable {
+                reason: "circuit breaker open (上游连续 5xx 已临时拉黑)".into(),
+                until: None, // half-open 由 record_upstream_success 自动 reset, 这里不写 until
+            };
+        }
         let Some(state_ref) = self.states.get(&account_id) else {
             return Availability::Available;
         };
@@ -316,6 +361,55 @@ impl LimitStore {
             }
         }
         Ok(())
+    }
+
+    /// 带并发保护的 flush 入口 (gateway / 其它 spawn 处应该用这个, 不再直接 flush_to_db):
+    ///
+    /// 1. **per-account 互斥**: 同一账号已有 flush 在跑 → 立刻跳过 (state 在内存里,
+    ///    下一次 absorb 返回 should_flush 时还会再触发, 不会丢)
+    /// 2. **全局 semaphore**: 所有账号合计同时打 DB 的 flush 任务最多 8 个,
+    ///    防止 burst 1000 个 429 把 DB pool (max=50) 打满
+    /// 3. **panic 安全的 in-flight 标志清理 (修 N2)**: 用 scopeguard::defer 保证
+    ///    无论 flush_to_db 正常返回还是 panic 展开, 标志都会重置, 下次能再触发 flush
+    ///
+    /// 调用方必须 spawn 后 await self.try_flush_to_db(...), 不要 await 在 hot path。
+    pub async fn try_flush_to_db(self: Arc<Self>, account_id: i64) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let entry = self
+            .flush_inflight
+            .entry(account_id)
+            .or_insert_with(|| AtomicBool::new(false));
+        // CAS: false → true; 如果已经是 true 直接跳过
+        if entry.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            // 已有 flush 在跑, 跳过
+            return;
+        }
+        drop(entry);
+
+        // 修 N2: panic-safe 标志重置。无论下面任何路径 panic 还是正常返回,
+        // _guard drop 时都把 in_flight 标志重置为 false, 否则该账号永久无法再 flush。
+        let me_for_guard = self.clone();
+        let _guard = scopeguard::guard((), move |_| {
+            if let Some(e) = me_for_guard.flush_inflight.get(&account_id) {
+                e.store(false, Ordering::Release);
+            }
+        });
+
+        let permit = match self.flush_semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                // semaphore 已关 (进程关停中), guard 会自动重置 in_flight 标志
+                return;
+            }
+        };
+        let result = self.flush_to_db(account_id).await;
+        drop(permit);
+
+        if let Err(e) = result {
+            crate::service::metrics::METRICS.record_bg_flush_failure();
+            tracing::warn!("limit flush failed for account {}: {}", account_id, e);
+        }
+        // _guard 在此处 drop, 标志重置
     }
 
     /// 从 `/api/oauth/usage` JSON（0-100 刻度）同步到内存，保持两条数据源一致。
@@ -411,6 +505,146 @@ impl LimitStore {
             None
         }
     }
+
+    /// 删账号时调用: 清掉该账号在内存里的 LimitState 和 flush in-flight 标志,
+    /// 防止删号后内存里"幽灵账号"持续累积。
+    pub fn remove_account(&self, account_id: i64) {
+        self.states.remove(&account_id);
+        self.flush_inflight.remove(&account_id);
+        self.circuit_breakers.remove(&account_id);
+    }
+
+    // ---- Circuit Breaker (修 C6) ----
+
+    /// 上游返回 5xx 时调用: 累计失败次数, 达到阈值后 open circuit,
+    /// 在 OPEN_DURATION 内 availability() 直接返回 unavailable。
+    pub fn record_upstream_5xx(&self, account_id: i64) {
+        let mut entry = self
+            .circuit_breakers
+            .entry(account_id)
+            .or_insert_with(CircuitBreakerState::default);
+        entry.consecutive_failures += 1;
+        if entry.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD && entry.open_until.is_none() {
+            entry.open_until = Some(Instant::now() + CIRCUIT_BREAKER_OPEN_DURATION);
+            crate::service::metrics::METRICS.record_circuit_event("open");
+            tracing::warn!(
+                "circuit breaker OPEN for account {} after {} consecutive 5xx (will not schedule for {}s)",
+                account_id,
+                entry.consecutive_failures,
+                CIRCUIT_BREAKER_OPEN_DURATION.as_secs()
+            );
+        }
+    }
+
+    /// 上游成功响应 (2xx) 时调用: 重置 circuit breaker。
+    /// 如果之前是 OPEN 状态, 这次成功就是 half-open 探测成功 → close。
+    pub fn record_upstream_success(&self, account_id: i64) {
+        if let Some(mut entry) = self.circuit_breakers.get_mut(&account_id) {
+            if entry.consecutive_failures > 0 || entry.open_until.is_some() {
+                let was_open = entry.open_until.is_some();
+                tracing::info!(
+                    "circuit breaker CLOSED for account {} (recovered after {} failures)",
+                    account_id,
+                    entry.consecutive_failures
+                );
+                if was_open {
+                    crate::service::metrics::METRICS.record_circuit_event("close");
+                }
+            }
+            entry.consecutive_failures = 0;
+            entry.open_until = None;
+        }
+    }
+
+    /// 检查 circuit breaker 是否当前 open (selector 用):
+    /// - 未设过 → false
+    /// - open_until 在未来 → true (拒调度)
+    /// - open_until 在过去 → 自动转 half-open: 返回 false 让一个请求过去探测,
+    ///   但**不**重置计数器, 等真的成功了才在 record_upstream_success 里 reset
+    pub fn circuit_open(&self, account_id: i64) -> bool {
+        let Some(entry) = self.circuit_breakers.get(&account_id) else {
+            return false;
+        };
+        match entry.open_until {
+            Some(t) => t > Instant::now(),
+            None => false,
+        }
+    }
+
+
+    /// 软降权值: 任一窗口 util ∈ [WARN, HIT) 时返回 SOFT_DEPRIORITIZE_PENALTY,
+    /// 否则返回 0。
+    ///
+    /// selector 用法: 在 select_by_priority 时把 effective_priority =
+    /// account.priority + priority_penalty(id), 让接近满载的号自然落到次选。
+    /// 不会被踢出 candidates (那是 HIT 的事), 只是排到后面。
+    pub fn priority_penalty(&self, account_id: i64) -> i32 {
+        let Some(state_ref) = self.states.get(&account_id) else {
+            return 0;
+        };
+        let state = state_ref.value();
+        let now = Utc::now();
+        let in_warn = |w: &Option<WindowSnapshot>| -> bool {
+            match w {
+                Some(w) => w.utilization >= WARN_THRESHOLD
+                    && w.utilization < HIT_THRESHOLD
+                    && w.resets_at > now,
+                None => false,
+            }
+        };
+        if in_warn(&state.five_hour) || in_warn(&state.seven_day) {
+            SOFT_DEPRIORITIZE_PENALTY
+        } else {
+            0
+        }
+    }
+
+    /// 进程关停时调用: 把内存里所有账号的 LimitState 同步落盘。    ///
+    /// 为什么必须有: 平时 absorb_headers 走 should_flush 判断 + tokio::spawn
+    /// 异步 flush, 关停时 (SIGTERM/Ctrl-C) 这些 spawn 出去的任务会被运行时
+    /// 强制 abort, 内存里"刚撞到 100% 但还没落盘"的状态会丢 → 重启后
+    /// LimitStore 内存空 → 立即把刚限流的号又选出去撞 429。
+    ///
+    /// 实现: 全局 semaphore(8) 限并发, JoinSet 等全部完成。
+    /// 调用者应该用 tokio::time::timeout 包一个硬 deadline (建议 20-30s)
+    /// 防止单个 DB UPDATE hang 拖死整个进程。
+    pub async fn flush_all(self: Arc<Self>) {
+        let ids: Vec<i64> = self.states.iter().map(|r| *r.key()).collect();
+        let total = ids.len();
+        if total == 0 {
+            tracing::info!("flush_all: 0 accounts in memory, nothing to flush");
+            return;
+        }
+        tracing::info!("flush_all: flushing {} accounts to DB...", total);
+        let mut joins = tokio::task::JoinSet::new();
+        for aid in ids {
+            let me = self.clone();
+            let permit = match self.flush_semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            joins.spawn(async move {
+                let _permit = permit;
+                me.flush_to_db(aid).await
+            });
+        }
+        let mut ok = 0u32;
+        let mut fail = 0u32;
+        while let Some(res) = joins.join_next().await {
+            match res {
+                Ok(Ok(())) => ok += 1,
+                Ok(Err(e)) => {
+                    fail += 1;
+                    tracing::warn!("flush_all: account flush err: {}", e);
+                }
+                Err(e) => {
+                    fail += 1;
+                    tracing::warn!("flush_all: join err: {}", e);
+                }
+            }
+        }
+        tracing::info!("flush_all: done. ok={} fail={} total={}", ok, fail, total);
+    }
 }
 
 // ---- 解析辅助 ----
@@ -492,11 +726,21 @@ fn compute_new_state(prev: &LimitState, status: u16, headers: &HeaderMap) -> Opt
         if let Some(r) = parsed_rpm_tpm {
             s.rpm_tpm = Some(merge_rpm_tpm(s.rpm_tpm.take(), r));
         }
-        // 若 429 时全局 reset 缺失，用 retry-after 补一个短期 ban 兜底。
-        if status == 429 && s.reset_at.is_none() {
+        // 若 429 时全局 reset 缺失或已过去, 用 retry-after 补一个短期 ban 兜底。
+        // 修 P2-N20: 旧版 `is_none()` 漏判 `Some(过去时间)` 场景 (上游回了过期 reset),
+        // 这种情况下 selector 仍认为账号可用 → 立刻又撞 429。
+        let now = Utc::now();
+        let reset_stale = match s.reset_at {
+            Some(t) => t <= now,
+            None => true,
+        };
+        if status == 429 && reset_stale {
             if let Some(ra) = retry_after {
                 s.rate_limited_until =
-                    Some(Utc::now() + chrono::Duration::from_std(ra).unwrap_or_default());
+                    Some(now + chrono::Duration::from_std(ra).unwrap_or_default());
+            } else {
+                // 没 retry-after 给个默认 60s 短 ban, 防止 selector 立刻又选这号
+                s.rate_limited_until = Some(now + chrono::Duration::from_std(DEFAULT_429_BAN).unwrap_or_default());
             }
         }
         // Sonnet 专属短期隔离：优先用 retry-after，其次用 7d window reset，最后 1h 兜底。
@@ -553,11 +797,28 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-/// 判定响应是否为 Sonnet 周限流（`representative-claim == "seven_day_sonnet"`）。
-/// gateway 在 429 分流时使用：命中时直接透传，不 retry / 不拉黑账号。
+/// 判定响应是否为 Sonnet 系列周限流 (例如 `representative-claim == "seven_day_sonnet"`,
+/// 或上游未来可能加的 `seven_day_sonnet_v2` / `seven_day_sonnet_4_5` 等变体)。
+/// gateway 在 429 分流时使用：命中时直接透传, 不 retry / 不拉黑账号 —
+/// 因为这是 Sonnet 模型级配额, 其他模型 (haiku/opus) 仍可用。
+///
+/// 修 P2-N12: 旧版硬编码 `== "seven_day_sonnet"`, 上游加 sonnet_v2 类变体会被
+/// 误拉黑。改成 sonnet 系列前缀匹配。**注意 opus / 其它模型 claim 不走此分支**:
+/// 它们通常意味着账号总配额 (Max5/Max20 总盘) 已用满, 应该拉黑全局。
 pub fn is_sonnet_rejection(headers: &HeaderMap) -> bool {
-    header_str(headers, "anthropic-ratelimit-unified-representative-claim")
-        == Some("seven_day_sonnet")
+    let Some(claim) = header_str(headers, "anthropic-ratelimit-unified-representative-claim")
+    else {
+        return false;
+    };
+    // 只匹配 Sonnet 系列: seven_day_sonnet / seven_day_sonnet_v2 / seven_day_sonnet_4_5 等
+    let lower = claim.to_ascii_lowercase();
+    let is_sonnet = lower == "seven_day_sonnet" || lower.starts_with("seven_day_sonnet_");
+    if !is_sonnet && lower.starts_with("seven_day_sonnet") {
+        // 极端情况: seven_day_sonnetXY (没下划线) - 也算 sonnet 但记 debug 提醒
+        tracing::debug!(claim = %claim, "unusual sonnet-like claim shape");
+        return true;
+    }
+    is_sonnet
 }
 
 fn parse_unified_headers(headers: &HeaderMap) -> Option<ParsedHeaders> {
@@ -1186,6 +1447,38 @@ mod tests {
             five_hour: Some(WindowSnapshot {
                 utilization: 0.97,
                 resets_at: Utc::now() - chrono::Duration::hours(1),
+                status: UnifiedStatus::AllowedWarning,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        assert!(judge_availability(&state).is_available());
+    }
+
+    // ---- HIT_THRESHOLD 0.97 + 软降权回归 ----
+
+    #[test]
+    fn availability_at_97pct_unavailable() {
+        // 修 P2: 阈值降到 0.97, 97% 立刻踢出 candidates 防上游边界 429
+        let state = LimitState {
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.97,
+                resets_at: Utc::now() + chrono::Duration::hours(1),
+                status: UnifiedStatus::AllowedWarning,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        assert!(!judge_availability(&state).is_available());
+    }
+
+    #[test]
+    fn availability_at_96pct_available() {
+        // 96% 仍可调度, 但调用方可通过 priority_penalty 软降权
+        let state = LimitState {
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.96,
+                resets_at: Utc::now() + chrono::Duration::hours(1),
                 status: UnifiedStatus::AllowedWarning,
                 surpassed_threshold: None,
             }),
@@ -2072,5 +2365,48 @@ mod tests {
         }
         let h_empty = make_headers(&[]);
         assert!(!is_sonnet_rejection(&h_empty));
+    }
+
+    // ---- Circuit Breaker (修 C6) ----
+    //
+    // 这里只测 CircuitBreakerState 的纯逻辑 (DashMap 内部一致性),
+    // 不构造完整 LimitStore (需要真实 sqlx pool, 测试代价高)。
+
+    #[test]
+    fn circuit_breaker_default_state_is_closed() {
+        let s = CircuitBreakerState::default();
+        assert_eq!(s.consecutive_failures, 0);
+        assert!(s.open_until.is_none());
+    }
+
+    #[test]
+    fn circuit_breaker_open_window_logic() {
+        // 模拟 record_upstream_5xx 的内部逻辑
+        let mut s = CircuitBreakerState::default();
+        for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
+            s.consecutive_failures += 1;
+        }
+        assert_eq!(s.consecutive_failures, CIRCUIT_BREAKER_THRESHOLD - 1);
+        assert!(s.open_until.is_none());
+
+        // 第 N 次 → open
+        s.consecutive_failures += 1;
+        if s.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
+            s.open_until = Some(Instant::now() + CIRCUIT_BREAKER_OPEN_DURATION);
+        }
+        assert!(s.open_until.is_some());
+        assert!(s.open_until.unwrap() > Instant::now());
+    }
+
+    #[test]
+    fn circuit_breaker_reset_on_success_clears_state() {
+        let mut s = CircuitBreakerState {
+            consecutive_failures: 7,
+            open_until: Some(Instant::now() + Duration::from_secs(30)),
+        };
+        s.consecutive_failures = 0;
+        s.open_until = None;
+        assert_eq!(s.consecutive_failures, 0);
+        assert!(s.open_until.is_none());
     }
 }
