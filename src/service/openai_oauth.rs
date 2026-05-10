@@ -169,6 +169,17 @@ pub struct IdTokenClaims {
     pub organization_id: String,
 }
 
+/// 解析 OpenAI OAuth id_token 的 payload (JWT 第二段) 提取 email/account_id 等。
+///
+/// **安全警告 (修 Y6)**: 此函数**不验证 JWT 签名**, 只解码 base64 payload。
+/// 调用方信任 payload 内容的前提是: id_token 来自可信信道 (HTTPS 直连
+/// auth.openai.com 或经过可信 proxy)。如果 proxy_url 走了不可信的 SOCKS / HTTP
+/// 代理, 攻击者可 MITM 替换 id_token 注入伪造的 organization_id / email,
+/// 导致后续该账号的 chatgpt-account-id header 全部错误 → 用户流量被路由到
+/// 错的 OpenAI 组织。
+///
+/// 商用部署必须保证: PROXY_URL (.env 或 admin UI 设置) 只用于 HTTPS 端点 +
+/// 来源可信。**绝不把不受控的开放代理填进去**。
 fn parse_id_token(id_token: &str) -> IdTokenClaims {
     let parts: Vec<&str> = id_token.split('.').collect();
     if parts.len() < 2 {

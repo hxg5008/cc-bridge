@@ -3,6 +3,45 @@ use crate::model::account::CanonicalEnvData;
 use crate::tlsfp::make_request_client;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+
+/// 截断并屏蔽上游错误 body 中的敏感字段 (修 Y1):
+/// 上游 OAuth/usage 出错时返回的 JSON 偶尔会回显 access_token / refresh_token /
+/// email 等。如果整个 body 进 error 日志, PII 和凭证就跟着落盘。
+/// 策略:
+///   1. 长度截断到 200 字符 (足够定位错误类型, 不足以泄漏完整 token)
+///   2. 屏蔽 Bearer XXX / sk-ant-XXX / sk-XXX 等模式
+pub(crate) fn sanitize_upstream_error_body(text: &str) -> String {
+    let trimmed: String = text.chars().take(200).collect();
+    // 极简屏蔽: 不引入 regex 依赖, 用字符串扫描
+    let mut out = String::with_capacity(trimmed.len());
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // 匹配 "Bearer " 后续到空格/末尾
+        if bytes[i..].starts_with(b"Bearer ") {
+            out.push_str("Bearer ***");
+            i += 7;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'"' {
+                i += 1;
+            }
+            continue;
+        }
+        // 匹配 sk-ant- / sk- 前缀的 token
+        if bytes[i..].starts_with(b"sk-ant-") || bytes[i..].starts_with(b"sk-") {
+            out.push_str("sk-***");
+            // 跳过 token 主体 (字母数字 + - _)
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
 use serde_json::Value;
 
 const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
@@ -133,10 +172,26 @@ pub async fn refresh_oauth_token(
     if resp.status() != 200 {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(AppError::Internal(format!(
-            "oauth refresh failed: status {} {}",
-            status, text
-        )));
+        // 错误归因 (供调用方区分临时 vs 永久):
+        //   4xx (含 401 invalid_grant / 400 invalid_request) → BadRequest = 永久, 凭证真的废了, 写 auth_error
+        //   429 → TooManyRequests = 临时, 上游限流, 不写 auth_error
+        //   5xx / 网络层 → Internal = 临时, 上游抖动, 不写 auth_error
+        // 修 Y1: 上游 body 走 sanitize, 防 Bearer / sk- 等敏感字段进 error 日志
+        let safe_text = sanitize_upstream_error_body(&text);
+        return Err(match status.as_u16() {
+            429 => AppError::TooManyRequests(format!(
+                "oauth refresh rate-limited: status {} {}",
+                status, safe_text
+            )),
+            400..=499 => AppError::BadRequest(format!(
+                "oauth refresh rejected: status {} {}",
+                status, safe_text
+            )),
+            _ => AppError::Internal(format!(
+                "oauth refresh failed: status {} {}",
+                status, safe_text
+            )),
+        });
     }
 
     let data: OAuthRefreshResponse = resp
@@ -183,16 +238,17 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
     let status = resp.status();
     if status != 200 {
         let text = resp.text().await.unwrap_or_default();
+        let safe_text = sanitize_upstream_error_body(&text);
         return Err(match status.as_u16() {
             401 | 403 => AppError::BadRequest(format!(
                 "usage fetch failed: status {} — token may be expired or invalid: {}",
-                status, text
+                status, safe_text
             )),
             429 => AppError::TooManyRequests(format!(
                 "usage endpoint rate limited (429), try again later: {}",
-                text
+                safe_text
             )),
-            _ => AppError::Internal(format!("usage fetch failed: status {} {}", status, text)),
+            _ => AppError::Internal(format!("usage fetch failed: status {} {}", status, safe_text)),
         });
     }
 
