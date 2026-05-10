@@ -18,9 +18,11 @@ RestartSec=5
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
-# Graceful shutdown: SIGTERM, 给 30s 排空 in-flight (binary 已实现 with_graceful_shutdown)
+# Graceful shutdown: SIGTERM, 给 50s 排空 in-flight + 状态落盘
+# (binary 内部硬 deadline 是 45s — flush LimitStore 15s + drain SSE 30s)
+# 给 systemd 留 5s 余量, 否则 30s 后被 SIGKILL 限流状态会丢
 KillSignal=SIGTERM
-TimeoutStopSec=30
+TimeoutStopSec=50
 
 # 资源限制 (可按需调)
 LimitNOFILE=65536
