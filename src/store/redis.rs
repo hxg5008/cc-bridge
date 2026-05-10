@@ -81,23 +81,41 @@ impl CacheStore for RedisStore {
     }
 
     async fn acquire_slot(&self, key: &str, max: i32, ttl: Duration) -> Result<bool, AppError> {
+        // Lua 脚本原子完成: INCR + (val=1 ? EXPIRE) + 超 max 时 DECR 回滚
+        // 旧实现 INCR 和 EXPIRE 分两次 RTT, 中间网络抖动 EXPIRE 丢包
+        // 会造成 key 永久存活 → 该账号并发槽永久占用一个名额, 累积到 max
+        // 后整账号被永久判为"满载"无法调度。
+        //
+        // 返回: 1 = 拿到槽; 0 = 已满
+        let script = redis::Script::new(
+            r#"
+            local v = redis.call("INCR", KEYS[1])
+            if v == 1 then
+                redis.call("EXPIRE", KEYS[1], ARGV[2])
+            end
+            if v > tonumber(ARGV[1]) then
+                redis.call("DECR", KEYS[1])
+                return 0
+            end
+            return 1
+            "#,
+        );
         let mut conn = self.client.clone();
-        let val: i64 = conn
-            .incr(key, 1i64)
+        let acquired: i64 = script
+            .key(key)
+            .arg(max as i64)
+            .arg(ttl.as_secs().max(1) as i64)
+            .invoke_async(&mut conn)
             .await
-            .map_err(|e| AppError::Internal(format!("redis incr: {}", e)))?;
-        if val == 1 {
-            let _: () = conn.expire(key, ttl.as_secs() as i64).await.unwrap_or(());
-        }
-        if val > max as i64 {
-            let _: () = conn.decr(key, 1i64).await.unwrap_or(());
-            return Ok(false);
-        }
-        Ok(true)
+            .map_err(|e| AppError::Internal(format!("redis acquire_slot: {}", e)))?;
+        Ok(acquired == 1)
     }
 
     async fn release_slot(&self, key: &str) {
-        let _: Result<(), _> = self.client.clone().decr(key, 1i64).await;
+        // 不再 unwrap_or 静默吞错, 失败要可观测 (错过 release 累积会让槽失效)
+        if let Err(e) = self.client.clone().decr::<_, _, i64>(key, 1i64).await {
+            tracing::warn!(key = %key, error = %e, "redis release_slot failed (slot may leak until TTL)");
+        }
     }
 
     async fn peek_slot(&self, key: &str) -> i64 {
@@ -136,5 +154,14 @@ impl CacheStore for RedisStore {
             "#,
         );
         let _: Result<i32, _> = script.key(key).arg(owner).invoke_async(&mut conn).await;
+    }
+
+    async fn ping(&self) -> Result<(), AppError> {
+        let mut conn = self.client.clone();
+        let _: String = redis::cmd("PING")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| AppError::Internal(format!("redis ping: {}", e)))?;
+        Ok(())
     }
 }

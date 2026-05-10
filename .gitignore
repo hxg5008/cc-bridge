@@ -19,3 +19,19 @@
 /postgresql:
 /tests/
 /claude-code
+
+# 运行时日志 (本地 release 启动产生)
+*.log
+*.err.log
+cc-bridge.log
+cc-bridge.err.log
+tmp.log
+
+# 备份目录 / 压缩包 (审计前的快照, 不进 repo)
+/cc-bridge-merged.bak-*
+*.bak
+*.tar.gz
+
+# Windows 本地开发启动脚本 (Linux 部署用 deploy/cc-bridge.service)
+/start.cmd
+/stop.cmd

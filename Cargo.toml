@@ -7,7 +7,7 @@ edition = "2024"
 # HTTP
 axum = { version = "0.7", features = ["macros"] }
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "timeout", "limit"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
@@ -31,6 +31,11 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "chrono", "an
 
 # 并发哈希表 (LimitStore 热路径,替 std::sync::Mutex<HashMap>)
 dashmap = "6"
+# 无毒 Mutex (std::sync::Mutex 持锁 panic 后会中毒, 后续 lock 全 panic;
+# 商用要避免单点 panic 拖死整个服务模块)
+parking_lot = "0.12"
+# RAII guard 用于 panic 安全的标志清理 (try_flush_to_db 等热路径)
+scopeguard = "1"
 
 # Redis
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
@@ -61,9 +66,9 @@ tokio-socks = "0.5"
 
 # HTTP Client
 reqwest = { version = "=0.12.4", default-features = false, features = ["rustls-tls-manual-roots", "stream", "json", "socks"] }
-scopeguard = "1"
 futures-core = "0.3"
 pin-project-lite = "0.2"
+bytes = "1"
 dotenvy = "0.15"
 
 # Utilities
@@ -77,4 +82,3 @@ rustls = { path = "craftls/rustls" }
 [dev-dependencies]
 futures-util = "0.3"
 async-stream = "0.3"
-bytes = "1"

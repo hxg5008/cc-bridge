@@ -1,6 +1,9 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+// parking_lot::Mutex 替 std::sync::Mutex (修 R3 同款 N1):
+// std Mutex 持锁时 panic 中毒会让整个 OAuth 链路永久挂掉
+use parking_lot::Mutex;
 
 use base64::Engine;
 use rand::Rng;
@@ -81,9 +84,22 @@ struct OAuthSession {
 }
 
 /// 内存级 OAuth 会话存储，带 TTL 自动清理。
+///
+/// 修 R3:
+///   - 旧版只在 set 时 retain 过期, take 不清理。攻击者 generate-auth-url
+///     刷出几十万 session 后不再调用 → 30 分钟内一直占内存 (单 session ~200B,
+///     100w session ≈ 200MB)
+///   - 新版加独立后台 GC tick (60s 一轮), 主动驱逐过期 session
+///   - parking_lot Mutex 防 panic 中毒
 struct SessionStore {
     sessions: Mutex<HashMap<String, OAuthSession>>,
 }
+
+/// 防止恶意刷 generate-auth-url 撑爆内存的硬上限。
+/// 商用 200-300 DAU 正常情况下同时挂起的 session 不会超过几十个,
+/// 上限 50K 留 1000x 余量同时把 OOM 风险盖死。
+const SESSION_HARD_CAP: usize = 50_000;
+const SESSION_GC_INTERVAL: Duration = Duration::from_secs(60);
 
 impl SessionStore {
     fn new() -> Self {
@@ -93,15 +109,32 @@ impl SessionStore {
     }
 
     fn set(&self, id: &str, session: OAuthSession) {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock();
         // 顺便清理过期会话
         map.retain(|_, s| s.created_at.elapsed() < SESSION_TTL);
+        // 命中硬上限 → 拒绝写入 (防穷举攻击撑爆)
+        if map.len() >= SESSION_HARD_CAP {
+            tracing::warn!(
+                "oauth session store hit hard cap ({}), rejecting new session", SESSION_HARD_CAP
+            );
+            return;
+        }
         map.insert(id.to_string(), session);
     }
 
     fn take(&self, id: &str) -> Option<OAuthSession> {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock();
         map.remove(id)
+    }
+
+    /// 后台 GC: 仅扫过期, 不动 hard cap (cap 已在 set 路径阻挡)。
+    fn gc_once(&self) {
+        let mut map = self.sessions.lock();
+        let before = map.len();
+        map.retain(|_, s| s.created_at.elapsed() < SESSION_TTL);
+        if before != map.len() {
+            tracing::debug!(before, after = map.len(), "oauth session store gc");
+        }
     }
 }
 
@@ -204,6 +237,10 @@ pub struct CookieAuthResponse {
     pub organization_uuid: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub email_address: String,
+    /// 自动从 /api/organizations 推导出的订阅档位:
+    /// "pro" | "max5" | "max20" | "free" | "" (未知)。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subscription_type: String,
 }
 
 #[derive(Deserialize)]
@@ -217,6 +254,12 @@ struct ClaudeOrganization {
     uuid: String,
     #[serde(default)]
     raven_type: Option<String>,
+    /// 例如 "default_claude_ai" (Pro/Free), "default_claude_max_5x", "default_claude_max_20x"
+    #[serde(default)]
+    rate_limit_tier: String,
+    /// 例如 ["chat", "claude_pro", "claude_code"] - 订阅 tag 与权限 tag 混在一起
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,14 +268,24 @@ struct ClaudeOrganization {
 
 /// 处理 OAuth 授权链接生成和 code 交换。
 pub struct OAuthFlowService {
-    store: SessionStore,
+    store: Arc<SessionStore>,
 }
 
 impl OAuthFlowService {
     pub fn new() -> Self {
-        Self {
-            store: SessionStore::new(),
-        }
+        let store = Arc::new(SessionStore::new());
+        // 修 R3: 后台 GC 防止"set 过期 / take 未调"积压
+        let weak = Arc::downgrade(&store);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SESSION_GC_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(store) = weak.upgrade() else { return; };
+                store.gc_once();
+            }
+        });
+        Self { store }
     }
 
     /// 生成 OAuth 授权 URL（完整 scope）。
@@ -281,9 +334,14 @@ impl OAuthFlowService {
             SCOPE_FULL
         };
 
-        // Step 1: 拿 organization uuid
-        let org_uuid = fetch_organization_uuid(&req.session_key, proxy).await?;
-        debug!("cookie_auth: 选中组织 {}", org_uuid);
+        // Step 1: 拿 organization uuid + 自动探测的订阅档位
+        let (org_uuid, subscription_type) =
+            fetch_organization_uuid(&req.session_key, proxy).await?;
+        debug!(
+            "cookie_auth: 选中组织 {} (订阅: {})",
+            org_uuid,
+            if subscription_type.is_empty() { "unknown" } else { &subscription_type }
+        );
 
         // Step 2: 生成 PKCE 三件套
         let state = generate_state();
@@ -303,7 +361,7 @@ impl OAuthFlowService {
         debug!("cookie_auth: 已拿到 authorization code");
 
         // Step 4: 交换 token
-        exchange_for_token(
+        let mut resp = exchange_for_token(
             &raw_code,
             &code_verifier,
             &state,
@@ -311,7 +369,9 @@ impl OAuthFlowService {
             is_setup_token,
             &org_uuid,
         )
-        .await
+        .await?;
+        resp.subscription_type = subscription_type;
+        Ok(resp)
     }
 
     // --- 内部实现 ---
@@ -475,7 +535,12 @@ const NETWORK_RETRIES: u32 = 2;
 
 /// Step 1: 用 sessionKey 拉 organizations 列表, 优先返回 raven_type=team 的 uuid,
 /// 否则返回第一个组织。
-async fn fetch_organization_uuid(session_key: &str, proxy_url: &str) -> Result<String, AppError> {
+/// 同时返回从 (rate_limit_tier, capabilities) 推导出的订阅档位
+/// (pro / max5 / max20 / free / "")。
+async fn fetch_organization_uuid(
+    session_key: &str,
+    proxy_url: &str,
+) -> Result<(String, String), AppError> {
     let mut last_err: Option<AppError> = None;
     for attempt in 1u32..=(NETWORK_RETRIES + 1) {
         match fetch_organization_uuid_once(session_key, proxy_url).await {
@@ -501,7 +566,7 @@ async fn fetch_organization_uuid(session_key: &str, proxy_url: &str) -> Result<S
 async fn fetch_organization_uuid_once(
     session_key: &str,
     proxy_url: &str,
-) -> Result<String, AppError> {
+) -> Result<(String, String), AppError> {
     let client = crate::tlsfp::make_request_client(proxy_url);
     let resp = client
         .get(ORGANIZATIONS_URL)
@@ -542,7 +607,81 @@ async fn fetch_organization_uuid_once(
         .iter()
         .find(|o| o.raven_type.as_deref() == Some("team"))
         .unwrap_or(&orgs[0]);
-    Ok(chosen.uuid.clone())
+    let tier = normalize_claude_rate_limit_tier(&chosen.rate_limit_tier, &chosen.capabilities);
+    Ok((chosen.uuid.clone(), tier))
+}
+
+/// 把 Anthropic 的 (rate_limit_tier, capabilities) 映射成稳定的订阅 ID:
+/// pro / max5 / max20 / free / "" (未知)。
+///
+/// 为什么两个字段都要看:
+///   单看 rate_limit_tier 区分不出 Pro 和 Free — 两者都可能返回
+///   "default_claude_ai"。真正的订阅信息编码在 capabilities[] 里
+///   (例如 "claude_pro" / "claude_max"), 与权限 tag (例如 "chat" /
+///   "claude_code" / "console") 混在一起。
+///
+/// 决策逻辑 (capabilities 优先, 然后 tier):
+///   capabilities 含 "claude_max":
+///     - tier ~ max_20x  → max20
+///     - tier ~ max_5x   → max5
+///     - 其它            → max5 (兜底, 罕见)
+///   capabilities 含 "claude_pro" → pro
+///   都没有 → free
+///
+/// 未知 tier 兜底返回原始小写, 让 UI 仍能展示新出现的档位。
+pub fn normalize_claude_rate_limit_tier(tier: &str, capabilities: &[String]) -> String {
+    let tier_lower = tier.trim().to_ascii_lowercase();
+
+    let mut has_max = false;
+    let mut has_pro = false;
+    for c in capabilities {
+        match c.trim().to_ascii_lowercase().as_str() {
+            "claude_max" => has_max = true,
+            "claude_pro" => has_pro = true,
+            _ => {}
+        }
+    }
+
+    if has_max {
+        return if tier_lower.contains("max_20x")
+            || tier_lower.contains("max_20")
+            || tier_lower.contains("max20")
+        {
+            "max20".to_string()
+        } else if tier_lower.contains("max_5x")
+            || tier_lower.contains("max_5")
+            || tier_lower.contains("max5")
+        {
+            "max5".to_string()
+        } else {
+            // claude_max 但 tier 没 5x/20x 后缀, 兜底为 max5
+            "max5".to_string()
+        };
+    }
+    if has_pro {
+        return "pro".to_string();
+    }
+
+    // 没有 claude_max / claude_pro tag — 按 tier 兜底
+    if tier_lower.is_empty() {
+        return String::new();
+    }
+    if tier_lower.contains("max_20x") || tier_lower.contains("max_20") || tier_lower.contains("max20") {
+        return "max20".to_string();
+    }
+    if tier_lower.contains("max_5x") || tier_lower.contains("max_5") || tier_lower.contains("max5") {
+        return "max5".to_string();
+    }
+    if tier_lower.contains("pro") {
+        return "pro".to_string();
+    }
+    if tier_lower.contains("free")
+        || tier_lower == "default_claude_ai"
+        || tier_lower == "default"
+    {
+        return "free".to_string();
+    }
+    tier_lower
 }
 
 /// Step 2: 用 sessionKey 调 /v1/oauth/{org}/authorize 拿 redirect_uri 中的
@@ -758,5 +897,6 @@ async fn exchange_for_token(
         } else {
             org_uuid_resp
         },
+        subscription_type: String::new(),
     })
 }
