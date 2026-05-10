@@ -108,6 +108,15 @@ onMounted(loadDashboard);
             >
               令牌
             </router-link>
+            <router-link
+              :to="{ name: 'cache-stats' }"
+              class="px-3 py-1.5 text-sm rounded-lg transition-colors"
+              :class="route.name === 'cache-stats'
+                ? 'bg-[#c4704f]/10 text-[#c4704f] font-medium'
+                : 'text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]'"
+            >
+              缓存统计
+            </router-link>
           </nav>
         </div>
         <Button

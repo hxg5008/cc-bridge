@@ -57,6 +57,7 @@ export interface Account {
   telemetry_count: number
   telemetry_expires_at?: string
   experimental_reveal_thinking?: boolean
+  enable_cache_ttl_1h_injection?: boolean
   rate_limited_at?: string
   rate_limit_reset_at?: string
   /** 内存里仍有效的短期限流截止时间 (RFC3339); 只在 dashboard 倒计时显示用,不持久化。
@@ -143,6 +144,38 @@ export interface Dashboard {
   tokens: number;
 }
 
+/** 总体缓存命中率统计（启动至今累计，重启清零）。 */
+export interface CacheStats {
+  sniffed_requests: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_5m_tokens: number;
+  cache_creation_1h_tokens: number;
+  total_tokens: number;
+  hit_rate_pct: number;
+  one_hour_share_pct: number;
+  saved_pct: number;
+  sticky_preserved_total: number;
+  sticky_evicted_total: number;
+  oauth_recovery_success: number;
+  oauth_recovery_failure: number;
+  per_account: PerAccountCacheStat[];
+}
+
+/** 单账号缓存命中率明细（启动至今累计）。 */
+export interface PerAccountCacheStat {
+  account_id: number;
+  account_email: string;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_5m_tokens: number;
+  cache_creation_1h_tokens: number;
+  sniffed_requests: number;
+  total_tokens: number;
+  hit_rate_pct: number;
+  one_hour_share_pct: number;
+}
+
 /** 与后端 AccountCategory 对应（snake_case） */
 export type AccountCategory =
   | 'available'
@@ -209,6 +242,7 @@ export const api = {
   updateToken: (id: number, t: Partial<ApiToken>) => request<ApiToken>('PUT', `/admin/tokens/${id}`, t),
   deleteToken: (id: number) => request<void>('DELETE', `/admin/tokens/${id}`),
   getDashboard: () => request<Dashboard>('GET', '/admin/dashboard'),
+  getCacheStats: () => request<CacheStats>('GET', '/admin/cache-stats'),
 
   generateAuthUrl: (proxyUrl?: string) =>
     request<OAuthGenerateResult>('POST', '/admin/oauth/generate-auth-url', { proxy_url: proxyUrl || null }),

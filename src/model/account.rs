@@ -185,6 +185,16 @@ pub struct Account {
     /// Anthropic 可能反 fingerprint，建议仅在测试账号开启。每个账号独立控制。
     #[serde(default)]
     pub experimental_reveal_thinking: bool,
+    /// 1h 缓存 TTL 注入：开启后，对发往 /v1/messages 的请求体中已有的
+    /// ephemeral cache_control 块强制写入 ttl="1h"，仅修改已存在的块，不新增缓存断点。
+    /// 移植自 sub2api v0.1.121。每个账号独立控制，建议先在 1-2 个测试账号开启验证。
+    #[serde(default)]
+    pub enable_cache_ttl_1h_injection: bool,
+    /// SessionKey from claude.ai cookie. Used for automatic OAuth recovery
+    /// when refresh_token is revoked. Empty string = no recovery available.
+    /// 明文存储；任何能 SELECT accounts 表的人能拿到完整登录凭证，请妥善保护 DB 访问权限。
+    #[serde(default)]
+    pub session_key: String,
     #[serde(default)]
     pub usage_data: Value,
     #[serde(skip_serializing_if = "Option::is_none")]

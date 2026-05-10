@@ -128,8 +128,29 @@ fn prompt_presets() -> HashMap<&'static str, CanonicalPromptEnvData> {
     m
 }
 
+/// 修 Y3: 旧版只有 [0] (代表非容器化桌面), 18 个账号全部 mem=0 → 强反指纹特征。
+/// 加入 4G/8G/16G 几档对应主流 docker / k8s pod 限制, 让上游聚合分布更自然。
+/// 0 占大头 (出现 2 次), 因为 claude-code CLI 主流场景是开发者桌面。
 static MEMORY_PRESETS: &[i64] = &[
-    0, // process.constrainedMemory() returns 0 on non-containerized environments
+    0, // native desktop / unconstrained
+    0, // (出现 2 次让 0 占 ~33%)
+    4 * 1024 * 1024 * 1024,  // 4 GiB pod
+    8 * 1024 * 1024 * 1024,  // 8 GiB pod
+    16 * 1024 * 1024 * 1024, // 16 GiB pod
+    2 * 1024 * 1024 * 1024,  // 2 GiB 容器
+];
+
+/// 修 Y2: 旧版 18 处全部硬编码 "2026-04-14T18:30:00Z", 上游聚合时
+/// "build_time 完全相同且与 version 期望发布时间不一致" → 强反指纹。
+/// 给几个真实接近 v2.1.x 发版时间的候选, 每个账号生成时随机抽。
+/// 注意: 必须与 CLAUDE_CODE_VERSION 时间相符, 升版本时一起更新此表。
+static BUILD_TIME_PRESETS: &[&str] = &[
+    "2026-04-14T18:30:00Z",
+    "2026-04-15T09:12:00Z",
+    "2026-04-13T22:48:00Z",
+    "2026-04-14T11:05:00Z",
+    "2026-04-15T16:33:00Z",
+    "2026-04-14T03:21:00Z",
 ];
 
 /// 生成随机的 64 字符十六进制字符串。
@@ -146,7 +167,12 @@ pub fn generate_canonical_identity() -> (String, Value, Value, Value) {
 
     let presets = env_presets();
     let preset = &presets[rng.gen_range(0..presets.len())];
-    let env_json = serde_json::to_value(preset).expect("env preset serialize");
+    // 修 Y2: 模板里 build_time 是占位符, 这里随机抽一个真实接近版本发布时间的值,
+    // 避免所有账号 build_time 完全一样形成指纹特征。
+    let mut env_with_random_build = preset.clone();
+    env_with_random_build.build_time =
+        BUILD_TIME_PRESETS[rng.gen_range(0..BUILD_TIME_PRESETS.len())].to_string();
+    let env_json = serde_json::to_value(&env_with_random_build).expect("env preset serialize");
 
     let prompts = prompt_presets();
     let prompt_env = prompts

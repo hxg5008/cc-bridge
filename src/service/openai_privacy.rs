@@ -80,7 +80,15 @@ pub async fn disable_openai_training(access_token: &str, proxy_url: &str) -> Pri
     let status = resp.status();
     if status == 403 || status == 503 {
         let body = resp.text().await.unwrap_or_default();
-        if body.contains("cloudflare") || body.contains("cf-") || body.contains("Just a moment") {
+        // 修 Y7: 旧版 `body.contains("cf-")` 误判面太大 (任何含 cf-ray header 的
+        // 正常错误响应都中招)。改成只匹配 Cloudflare 真实拦截页特征字符串,
+        // 这两个 marker 几乎只在 Cloudflare challenge 页面出现, 误判率近零。
+        let is_cf_block = body.contains("Just a moment...") // CF 标志 title
+            || body.contains("__cf_chl_opt") // CF challenge JS 全局变量
+            || body.contains("cf-browser-verification") // CF challenge form id
+            || body.contains("cf_chl_") // CF challenge 各种相关标识
+            ;
+        if is_cf_block {
             warn!(target: "openai_privacy", "cf_blocked status={}", status);
             return PrivacyMode::CFBlocked;
         }

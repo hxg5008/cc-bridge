@@ -39,6 +39,8 @@ function onViewModeChange(mode: 'detail' | 'compact') {
 const searchQuery = ref<string>('');
 /** 平台过滤 (UI 端筛选; '' = 全部) */
 const platformFilter = ref<string>('');
+/** 订阅档位过滤 (claude only; '' = 全部) */
+const subscriptionFilter = ref<string>('');
 /** 分类筛选 (来自 URL ?filter=, 跟 dashboard 顶部卡片联动) */
 const route = useRoute();
 const categoryFilter = computed<AccountCategory | 'all'>(() => {
@@ -58,6 +60,13 @@ const filteredAccounts = computed(() => {
         : a.platform === platformFilter.value,
     );
   }
+  if (subscriptionFilter.value) {
+    list = list.filter((a) => {
+      const t = (a.subscription_type || '').toLowerCase();
+      if (subscriptionFilter.value === '__none__') return !t;
+      return t === subscriptionFilter.value;
+    });
+  }
   if (categoryFilter.value !== 'all') {
     list = list.filter((a) => a.category === categoryFilter.value);
   }
@@ -70,6 +79,34 @@ const filteredAccounts = computed(() => {
   }
   return list;
 });
+
+/** 订阅档位 → 显示标签 (max5/max20/pro/free/...) */
+function subscriptionLabel(t?: string | null): string {
+  switch ((t || '').toLowerCase()) {
+    case 'pro': return 'Pro';
+    case 'max5': return 'Max 5x';
+    case 'max20': return 'Max 20x';
+    case 'free': return 'Free';
+    case 'max': return 'Max';
+    case 'team': return 'Team';
+    case 'enterprise': return 'Enterprise';
+    default: return t || '';
+  }
+}
+
+/** 订阅档位 → tailwind 颜色 (跟 badge 风格一致) */
+function subscriptionBadgeClass(t?: string | null): string {
+  switch ((t || '').toLowerCase()) {
+    case 'max20': return 'bg-purple-100 text-purple-700 border-purple-200';
+    case 'max5':
+    case 'max': return 'bg-amber-100 text-amber-700 border-amber-200';
+    case 'pro': return 'bg-sky-100 text-sky-700 border-sky-200';
+    case 'team': return 'bg-indigo-100 text-indigo-700 border-indigo-200';
+    case 'enterprise': return 'bg-fuchsia-100 text-fuchsia-700 border-fuchsia-200';
+    case 'free': return 'bg-gray-100 text-gray-600 border-gray-200';
+    default: return 'bg-stone-100 text-stone-600 border-stone-200';
+  }
+}
 
 /** 5 类徽章中文文字 */
 function categoryLabel(c?: AccountCategory): string {
@@ -134,6 +171,7 @@ const form = ref({
   priority: 50,
   auto_telemetry: false,
   experimental_reveal_thinking: false,
+  enable_cache_ttl_1h_injection: false,
   // OpenAI 专用 (走 account.extra,仅在编辑 platform=openai 账号时显示)
   chatgpt_account_id: '',
   organization_id: '',
@@ -255,6 +293,7 @@ function openCreate() {
     priority: 50,
     auto_telemetry: false,
     experimental_reveal_thinking: false,
+    enable_cache_ttl_1h_injection: false,
     chatgpt_account_id: '',
     organization_id: '',
     base_url: '',
@@ -286,6 +325,7 @@ function openEdit(a: Account) {
     priority: a.priority,
     auto_telemetry: a.auto_telemetry ?? false,
     experimental_reveal_thinking: a.experimental_reveal_thinking ?? false,
+    enable_cache_ttl_1h_injection: a.enable_cache_ttl_1h_injection ?? false,
     chatgpt_account_id: typeof extra.chatgpt_account_id === 'string' ? extra.chatgpt_account_id : '',
     organization_id: typeof extra.organization_id === 'string' ? extra.organization_id : '',
     base_url: typeof extra.base_url === 'string' ? extra.base_url : '',
@@ -329,13 +369,14 @@ async function save() {
           base_url: form.value.base_url.trim(),
         };
       } else {
-        // Claude 账号: billing_mode / 订阅 / Account/Org UUID / 自动遥测 / 思考显示
+        // Claude 账号: billing_mode / Account/Org UUID / 自动遥测 / 思考显示
+        // subscription_type 不在这里维护, 由 cookie_auth 自动探测 + 刷新订阅按钮负责
         updates.billing_mode = form.value.billing_mode;
         updates.account_uuid = form.value.account_uuid || null;
         updates.organization_uuid = form.value.organization_uuid || null;
-        updates.subscription_type = form.value.subscription_type || null;
         updates.auto_telemetry = form.value.auto_telemetry;
         updates.experimental_reveal_thinking = form.value.experimental_reveal_thinking;
+        updates.enable_cache_ttl_1h_injection = form.value.enable_cache_ttl_1h_injection;
       }
       await api.updateAccount(editing.value.id, updates);
     } else {
@@ -356,11 +397,11 @@ async function save() {
         billing_mode: form.value.billing_mode,
         account_uuid: form.value.account_uuid || null,
         organization_uuid: form.value.organization_uuid || null,
-        subscription_type: form.value.subscription_type || null,
         concurrency: form.value.concurrency,
         priority: form.value.priority,
         auto_telemetry: form.value.auto_telemetry,
         experimental_reveal_thinking: form.value.experimental_reveal_thinking,
+        enable_cache_ttl_1h_injection: form.value.enable_cache_ttl_1h_injection,
       };
       if (normalizedExpiresAt) payload.expires_at = normalizedExpiresAt;
       await api.createAccount(payload);
@@ -726,7 +767,6 @@ const skImportScope = ref<'full' | 'inference'>('full');         // OAuth scope
 const skImportConcurrency = ref(3);                              // 并发上限
 const skImportBillingMode = ref<'strip' | 'rewrite'>('strip');
 const skImportAutoTelemetry = ref(false);
-const skImportSubscription = ref<string>('');
 const skImportLoading = ref(false);
 const skImportStep = ref<'form' | 'result'>('form');             // 'form' = 输入, 'result' = 展示结果
 const skImportResults = ref<{ total: number; success: number; failed: number; results: any[] } | null>(null);
@@ -745,7 +785,6 @@ function openSessionKeyImport() {
   skImportConcurrency.value = 3;
   skImportBillingMode.value = 'strip';
   skImportAutoTelemetry.value = false;
-  skImportSubscription.value = '';
   skImportStep.value = 'form';
   skImportResults.value = null;
   skImportLoading.value = false;
@@ -801,7 +840,6 @@ async function runBatchInternal(sessionKeys: string[]) {
       concurrency_limit: skImportConcurrency.value,
       billing_mode: skImportBillingMode.value,
       auto_telemetry: skImportAutoTelemetry.value,
-      subscription_type: skImportSubscription.value || undefined,
     });
     skImportResults.value = resp;
     skImportStep.value = 'result';
@@ -1084,6 +1122,7 @@ function applyOAuthResult() {
     priority: 50,
     auto_telemetry: false,
     experimental_reveal_thinking: false,
+    enable_cache_ttl_1h_injection: false,
     chatgpt_account_id: '',
     organization_id: '',
     base_url: '',
@@ -1133,86 +1172,102 @@ async function copyText(text: string) {
 <template>
   <div class="space-y-4">
     <!-- 标题栏 -->
-    <div class="flex flex-wrap justify-between items-center gap-y-2">
-      <div class="flex items-center gap-3 flex-wrap">
-        <h2 class="text-lg font-semibold text-[#29261e]">账号管理</h2>
-        <!-- 视图切换 -->
-        <div class="flex items-center bg-[#f9f6f1] border border-[#e8e2d9] rounded-lg overflow-hidden">
-          <button
-            type="button"
-            @click="onViewModeChange('detail')"
-            class="px-3 py-1.5 text-sm transition-colors"
-            :class="viewMode === 'detail'
-              ? 'bg-[#c4704f] text-white font-medium'
-              : 'text-[#5c5647] hover:bg-[#e8e2d9]/40'"
-          >
-            详情
-          </button>
-          <button
-            type="button"
-            @click="onViewModeChange('compact')"
-            class="px-3 py-1.5 text-sm transition-colors"
-            :class="viewMode === 'compact'
-              ? 'bg-[#c4704f] text-white font-medium'
-              : 'text-[#5c5647] hover:bg-[#e8e2d9]/40'"
-          >
-            紧凑
-          </button>
-        </div>
-        <select
-          v-model="platformFilter"
-          class="text-sm bg-white border border-[#e8e2d9] rounded-lg px-3 py-1.5 text-[#5c5647] hover:border-[#c4704f]/50 focus:outline-none focus:border-[#c4704f]"
+    <div class="flex items-center gap-2 flex-wrap">
+      <h2 class="text-lg font-semibold text-[#29261e] mr-1">账号管理</h2>
+      <!-- 视图切换 -->
+      <div class="flex items-center bg-[#f9f6f1] border border-[#e8e2d9] rounded-lg overflow-hidden h-8">
+        <button
+          type="button"
+          @click="onViewModeChange('detail')"
+          class="px-3 h-full text-xs transition-colors"
+          :class="viewMode === 'detail'
+            ? 'bg-[#c4704f] text-white font-medium'
+            : 'text-[#5c5647] hover:bg-[#e8e2d9]/40'"
         >
-          <option value="">全部平台</option>
-          <option value="claude">Anthropic</option>
-          <option value="openai">OpenAI</option>
-          <option value="gemini">Gemini</option>
-          <option value="antigravity">Antigravity</option>
-        </select>
-        <select
-          v-model.number="autoRefreshSec"
-          @change="onAutoRefreshChange"
-          class="text-sm bg-white border border-[#e8e2d9] rounded-lg px-3 py-1.5 text-[#5c5647] hover:border-[#c4704f]/50 focus:outline-none focus:border-[#c4704f]"
-          title="自动刷新: 拉用量 + 重渲账号列表 + dashboard 计数。后端走 60s 缓存,不会真高频打上游 API"
+          详情
+        </button>
+        <button
+          type="button"
+          @click="onViewModeChange('compact')"
+          class="px-3 h-full text-xs transition-colors"
+          :class="viewMode === 'compact'
+            ? 'bg-[#c4704f] text-white font-medium'
+            : 'text-[#5c5647] hover:bg-[#e8e2d9]/40'"
         >
-          <option v-for="opt in AUTO_REFRESH_OPTIONS" :key="opt.value" :value="opt.value">
-            自动刷新: {{ opt.label }}
-          </option>
-        </select>
-        <input
-          v-model="searchQuery"
-          type="search"
-          placeholder="搜索 email / name..."
-          class="text-sm bg-white border border-[#e8e2d9] rounded-lg px-3 py-1.5 text-[#5c5647] hover:border-[#c4704f]/50 focus:outline-none focus:border-[#c4704f] w-48"
-        />
-        <span class="text-xs text-[#8c8475]">{{ filteredAccounts.length }} / {{ accounts.length }}</span>
+          紧凑
+        </button>
       </div>
-      <div class="flex gap-2">
-        <Button
-          @click="openSessionKeyImport"
-          class="bg-[#5b8a72] hover:bg-[#4a7a62] text-white font-medium rounded-xl transition-all duration-200 hover:shadow-md"
-        >
-          SessionKey 导入
-        </Button>
-        <Button
-          @click="openOpenAIImport"
-          class="bg-[#3a6ea5] hover:bg-[#2f5d8e] text-white font-medium rounded-xl transition-all duration-200 hover:shadow-md"
-        >
-          OpenAI 导入
-        </Button>
-        <Button
-          @click="openOAuthFlow"
-          class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl transition-all duration-200 hover:shadow-md"
-        >
-          授权登录
-        </Button>
-        <Button
-          @click="openCreate"
-          class="bg-[#c4704f] hover:bg-[#b5623f] text-white font-medium rounded-xl transition-all duration-200 hover:shadow-md"
-        >
-          添加账号
-        </Button>
-      </div>
+      <select
+        v-model="platformFilter"
+        class="h-8 text-xs bg-white border border-[#e8e2d9] rounded-lg px-2 text-[#5c5647] hover:border-[#c4704f]/50 focus:outline-none focus:border-[#c4704f]"
+      >
+        <option value="">全部平台</option>
+        <option value="claude">Anthropic</option>
+        <option value="openai">OpenAI</option>
+        <option value="gemini">Gemini</option>
+        <option value="antigravity">Antigravity</option>
+      </select>
+      <select
+        v-model="subscriptionFilter"
+        class="h-8 text-xs bg-white border border-[#e8e2d9] rounded-lg px-2 text-[#5c5647] hover:border-[#c4704f]/50 focus:outline-none focus:border-[#c4704f]"
+        title="按订阅档位筛选 (来自 /api/organizations 自动检测)"
+      >
+        <option value="">全部订阅</option>
+        <option value="max20">Max 20x</option>
+        <option value="max5">Max 5x</option>
+        <option value="pro">Pro</option>
+        <option value="free">Free</option>
+        <option value="__none__">未识别</option>
+      </select>
+      <select
+        v-model.number="autoRefreshSec"
+        @change="onAutoRefreshChange"
+        class="h-8 text-xs bg-white border border-[#e8e2d9] rounded-lg px-2 text-[#5c5647] hover:border-[#c4704f]/50 focus:outline-none focus:border-[#c4704f]"
+        title="自动刷新: 拉用量 + 重渲账号列表 + dashboard 计数。后端走 60s 缓存,不会真高频打上游 API"
+      >
+        <option v-for="opt in AUTO_REFRESH_OPTIONS" :key="opt.value" :value="opt.value">
+          刷新 {{ opt.label }}
+        </option>
+      </select>
+      <input
+        v-model="searchQuery"
+        type="search"
+        placeholder="搜索 email / name..."
+        class="h-8 text-xs bg-white border border-[#e8e2d9] rounded-lg px-2 text-[#5c5647] hover:border-[#c4704f]/50 focus:outline-none focus:border-[#c4704f] w-44"
+      />
+      <span class="text-xs text-[#8c8475] tabular-nums">{{ filteredAccounts.length }} / {{ accounts.length }}</span>
+
+      <!-- 占位让按钮组靠右 -->
+      <div class="flex-1"></div>
+
+      <Button
+        size="sm"
+        @click="openSessionKeyImport"
+        class="bg-[#5b8a72] hover:bg-[#4a7a62] text-white text-xs font-medium rounded-lg transition-all duration-200 hover:shadow-md"
+      >
+        SessionKey 导入
+      </Button>
+      <Button
+        size="sm"
+        @click="openOpenAIImport"
+        class="bg-[#3a6ea5] hover:bg-[#2f5d8e] text-white text-xs font-medium rounded-lg transition-all duration-200 hover:shadow-md"
+      >
+        OpenAI 导入
+      </Button>
+      <Button
+        size="sm"
+        @click="openOAuthFlow"
+        class="bg-[#c4704f] hover:bg-[#b5623f] text-white text-xs font-medium rounded-lg transition-all duration-200 hover:shadow-md"
+      >
+        授权登录
+      </Button>
+      <Button
+        size="sm"
+        @click="openCreate"
+        class="bg-[#c4704f] hover:bg-[#b5623f] text-white text-xs font-medium rounded-lg transition-all duration-200 hover:shadow-md"
+      >
+        添加账号
+      </Button>
     </div>
 
     <!-- 紧凑视图: 批量操作工具条 (仅选中 ≥1 时显示) -->
@@ -1296,9 +1351,19 @@ async function copyText(text: string) {
                 {{ a.auth_type === 'oauth' ? 'OAuth' : 'Token' }}
               </td>
               <td class="px-2 py-2 align-middle">
-                <Badge :class="statusStyle(a).class" class="border text-xs font-medium">
-                  {{ statusStyle(a).label }}
-                </Badge>
+                <div class="flex flex-col gap-0.5 items-start">
+                  <Badge
+                    v-if="(!a.platform || a.platform === 'claude') && a.subscription_type"
+                    :class="subscriptionBadgeClass(a.subscription_type)"
+                    class="border text-[10px] font-semibold px-1.5 py-0"
+                    :title="`订阅: ${subscriptionLabel(a.subscription_type)}`"
+                  >
+                    {{ subscriptionLabel(a.subscription_type) }}
+                  </Badge>
+                  <Badge :class="statusStyle(a).class" class="border text-xs font-medium">
+                    {{ statusStyle(a).label }}
+                  </Badge>
+                </div>
                 <div v-if="a.category === 'rate_limited' && a.category_recovers_at"
                      class="text-[10px] text-orange-700 mt-0.5">
                   {{ tick, recoversInText(a.category_recovers_at) }}
@@ -1381,6 +1446,15 @@ async function copyText(text: string) {
               </div>
             </div>
             <div class="flex flex-col items-end gap-1 flex-shrink-0">
+              <!-- 订阅档位 badge: 在状态前显示 (来自 /api/organizations 自动检测) -->
+              <Badge
+                v-if="(!a.platform || a.platform === 'claude') && a.subscription_type"
+                :class="subscriptionBadgeClass(a.subscription_type)"
+                class="border text-xs font-semibold"
+                :title="`订阅档位: ${subscriptionLabel(a.subscription_type)} (来自 /api/organizations)`"
+              >
+                {{ subscriptionLabel(a.subscription_type) }}
+              </Badge>
               <Badge :class="statusStyle(a).class" class="border text-xs font-medium">
                 {{ statusStyle(a).label }}
               </Badge>
@@ -1446,6 +1520,10 @@ async function copyText(text: string) {
                 <p v-if="a.telemetry_expires_at" class="text-xs text-amber-500 mt-0.5">
                   遥测中 · 停止于 {{ new Date(a.telemetry_expires_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}
                 </p>
+              </div>
+              <div v-if="(!a.platform || a.platform === 'claude') && a.enable_cache_ttl_1h_injection">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">1h 缓存注入</p>
+                <p class="text-sm text-amber-600">已开启</p>
               </div>
               <div>
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">
@@ -1910,30 +1988,7 @@ async function copyText(text: string) {
               </button>
             </div>
           </div>
-          <!-- 遥测身份（选填） -->
-          <div class="space-y-2">
-            <Label class="text-[#5c5647] text-sm">订阅类型（选填，强烈推荐）</Label>
-            <div class="flex gap-2 flex-wrap">
-              <button
-                v-for="opt in [
-                  { value: '', label: '未设置' },
-                  { value: 'max', label: 'Max' },
-                  { value: 'pro', label: 'Pro' },
-                  { value: 'team', label: 'Team' },
-                  { value: 'enterprise', label: 'Enterprise' },
-                ]"
-                :key="opt.value"
-                type="button"
-                @click="form.subscription_type = opt.value"
-                class="px-3 py-1.5 rounded-lg text-xs font-medium border transition-all duration-200"
-                :class="form.subscription_type === opt.value
-                  ? 'bg-[#c4704f]/10 border-[#c4704f] text-[#c4704f]'
-                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-[#c4704f]/40'"
-              >
-                {{ opt.label }}
-              </button>
-            </div>
-          </div>
+          <!-- 订阅类型: 已删除手动选择, 现在通过 SessionKey 导入时自动从 /api/organizations 探测 -->
           <div class="flex gap-4">
             <div class="flex-1 space-y-2">
               <Label class="text-[#5c5647] text-sm">Account UUID（选填）</Label>
@@ -2006,6 +2061,35 @@ async function copyText(text: string) {
               </button>
             </div>
             <p class="text-xs text-[#b5b0a6]">剥离 redact-thinking beta token，让模型思考正文回流到 Claude Code 终端。Anthropic 可能反指纹检测，建议仅在测试号开启，每个账号独立控制。</p>
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">
+              1h 缓存 TTL 注入
+              <span class="ml-2 inline-block px-1.5 py-0.5 text-[10px] rounded border border-amber-400 bg-amber-50 text-amber-700 align-middle">实验性</span>
+            </Label>
+            <div class="flex gap-2">
+              <button
+                type="button"
+                @click="form.enable_cache_ttl_1h_injection = false"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="!form.enable_cache_ttl_1h_injection
+                  ? 'bg-[#f9f6f1] border-[#8c8475] text-[#5c5647]'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-[#8c8475]/40'"
+              >
+                关闭
+              </button>
+              <button
+                type="button"
+                @click="form.enable_cache_ttl_1h_injection = true"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="form.enable_cache_ttl_1h_injection
+                  ? 'bg-amber-50 border-amber-400 text-amber-700'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+              >
+                开启
+              </button>
+            </div>
+            <p class="text-xs text-[#b5b0a6]">把请求体里已有的 ephemeral cache_control 块强制写入 ttl="1h"，不新增缓存断点。命中率提升但有指纹偏离风险，建议先在 1-2 个测试号开启验证。</p>
           </div>
           </template>
           <div class="flex gap-4">
@@ -2394,21 +2478,7 @@ async function copyText(text: string) {
               </div>
             </div>
 
-            <div class="space-y-2">
-              <Label class="text-[#5c5647] text-sm">订阅类型 (可选)</Label>
-              <div class="flex gap-2 flex-wrap">
-                <button
-                  v-for="opt in [{value:'',label:'未设置'},{value:'max',label:'Max'},{value:'pro',label:'Pro'},{value:'team',label:'Team'},{value:'enterprise',label:'Enterprise'}]"
-                  :key="opt.value"
-                  type="button"
-                  @click="skImportSubscription = opt.value"
-                  class="px-3 py-1.5 rounded-lg text-sm font-medium border transition-all duration-200"
-                  :class="skImportSubscription === opt.value ? 'bg-amber-50 border-amber-400 text-amber-600' : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
-                >
-                  {{ opt.label }}
-                </button>
-              </div>
-            </div>
+            <!-- 订阅类型: 已删除手动选择, 后端 cookie_auth 会自动调 /api/organizations 探测 pro/max5/max20 -->
 
             <div class="flex items-center gap-2">
               <input

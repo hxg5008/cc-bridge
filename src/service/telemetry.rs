@@ -360,14 +360,66 @@ async fn telemetry_loop(
             session.next_event_allowed_at = now + Duration::from_secs(jitter_secs);
             drop(map);
 
-            send_telemetry(
-                &c,
-                &format!("{}/api/event_logging/batch", UPSTREAM_BASE),
-                &token,
-                &payload,
-                &session_ua(&store, account_id).await,
-            )
-            .await;
+            // 修 Y5: 当 batch 含 startup 时, 把 startup 拆出来单独先发, 再 sleep
+            // 200-800ms 后发剩余事件 (api_query / autoupdater 等)。
+            // Anthropic 时序分析能看到"startup 与 api_query timestamp 完全相同"
+            // 是真实 CLI 不可能出现的特征。
+            let split_startup = emit_startup
+                && payload
+                    .get("events")
+                    .and_then(|e| e.as_array())
+                    .map(|a| a.len() > 1)
+                    .unwrap_or(false);
+
+            if split_startup {
+                // 拆 events: 第一个是 startup, 单独发
+                let mut startup_payload = payload.clone();
+                let mut rest_payload = payload.clone();
+                if let Some(events) = startup_payload
+                    .get_mut("events")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    events.truncate(1); // 只保留 startup
+                }
+                if let Some(events) = rest_payload
+                    .get_mut("events")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    events.remove(0); // 去掉 startup, 剩下 api_query 等
+                }
+                let ua = session_ua(&store, account_id).await;
+                send_telemetry(
+                    &c,
+                    &format!("{}/api/event_logging/batch", UPSTREAM_BASE),
+                    &token,
+                    &startup_payload,
+                    &ua,
+                )
+                .await;
+                // 模拟真实用户敲完命令再发请求的间隔: 200-800ms 随机
+                let delay_ms = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(200..=800)
+                };
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                send_telemetry(
+                    &c,
+                    &format!("{}/api/event_logging/batch", UPSTREAM_BASE),
+                    &token,
+                    &rest_payload,
+                    &ua,
+                )
+                .await;
+            } else {
+                send_telemetry(
+                    &c,
+                    &format!("{}/api/event_logging/batch", UPSTREAM_BASE),
+                    &token,
+                    &payload,
+                    &session_ua(&store, account_id).await,
+                )
+                .await;
+            }
 
             let _ = store.increment_telemetry_count(account_id, 1).await;
             continue;
@@ -898,6 +950,8 @@ mod tests {
             auto_telemetry: true,
             telemetry_count: 0,
             experimental_reveal_thinking: false,
+            enable_cache_ttl_1h_injection: false,
+            session_key: String::new(),
             usage_data: json!({}),
             usage_fetched_at: None,
             platform: "claude".into(),
