@@ -202,14 +202,21 @@ async fn run(workers: usize) {
     let server = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal_and_flush(limit_store_for_shutdown));
 
-    // 硬 deadline: 收到信号后总共最多等 45s, 超时强制退出
-    // (graceful drain 30s 留给 SSE 流自然结束 + 15s 给 flush_all)
-    match tokio::time::timeout(std::time::Duration::from_secs(45), server).await {
-        Ok(Ok(())) => info!("clean exit"),
-        Ok(Err(e)) => tracing::error!("serve error: {}", e),
-        Err(_) => tracing::warn!(
-            "graceful shutdown exceeded 45s, exiting forcefully (in-flight SSE may drop)"
-        ),
+    // 关键 (修 v1.9.1 的严重 bug): 这里**绝不**能套外层 tokio::time::timeout(45s, server)
+    // — `tokio::time::timeout` 是从 await 那一刻起算的绝对时间, 套在 server 上意味着
+    // **服务启动 45 秒后被强制 abort**, 跟 graceful shutdown 信号无关。
+    // v1.9.0 上线后实测每 45 秒重启一次, RestartCount 累积上千。
+    //
+    // 正确架构:
+    //   - 应用层: 收到 SIGTERM → shutdown_signal_and_flush 跑完 (内部 15s flush 兜底)
+    //     → axum 内部 graceful drain 自然完成 → server.await 返回 → 进程退
+    //   - 强杀兜底: 由 docker stop_grace_period (compose 设 60s) 或
+    //     systemd TimeoutStopSec (unit 设 50s) 在容器/进程外部生效
+    //   - 不需要应用层自己强杀
+    if let Err(e) = server.await {
+        tracing::error!("serve error: {}", e);
+    } else {
+        info!("clean exit");
     }
 }
 
