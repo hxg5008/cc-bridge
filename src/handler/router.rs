@@ -487,7 +487,12 @@ async fn openai_chat_completions_inner(
         &body_json_orig,
         client_pck.as_deref(),
     );
-    let session_hash = crate::service::codex_session::sticky_session_cache_key(&raw_seed);
+    // 修 N3 同款 (Anthropic 路径已修, OpenAI 路径漏): 加 api_token.id 命名空间,
+    // 防多租户串号 — 两个不同 api_token 用相同 prompt_cache_key 时不会
+    // 命中同一 sticky 账号。
+    let namespaced_seed = format!("tk{}|{}", api_token.id, raw_seed);
+    let session_hash =
+        crate::service::codex_session::sticky_session_cache_key(&namespaced_seed);
 
     let allowed_ids = api_token.allowed_account_ids();
     let mut exclude_ids = api_token.blocked_account_ids();

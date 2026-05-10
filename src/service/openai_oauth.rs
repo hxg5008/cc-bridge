@@ -7,8 +7,10 @@
 //!   - id_token JWT 解析获取 chatgpt_account_id / chatgpt_user_id / organization_id
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+// parking_lot::Mutex 替 std::sync::Mutex (跟 N1/R3 同款修复, 漏掉了 OpenAI 路径):
+// std Mutex 持锁时 panic 中毒会让 OpenAI OAuth 子系统永久挂掉, parking_lot 不会。
+use parking_lot::Mutex;
 
 use base64::Engine;
 use rand::Rng;
@@ -85,12 +87,12 @@ impl SessionStore {
         }
     }
     fn set(&self, id: &str, s: OpenAISession) {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock();
         map.retain(|_, v| v.created_at.elapsed() < SESSION_TTL);
         map.insert(id.to_string(), s);
     }
     fn take(&self, id: &str) -> Option<OpenAISession> {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock();
         map.remove(id)
     }
 }
