@@ -464,30 +464,14 @@ impl GatewayService {
             }
 
             // 获取并发槽位 (account-level)
-            // v1.9.15: acquire 失败时 retry 到另一个号 (而不是直接返客户端 429)。
-            // 场景: 多客户端同 prompt → sticky 全打到一个号 → 该号 concurrency 满 →
-            // 之前直接 429 返客户端 (用户报 "批量测试 6 个总有 429")。
-            // 158+ 空闲 slot 在其他号上, retry 一次几乎必中。
-            // 代价: 该次 prompt cache miss (新号没该 prompt 缓存), 成本 ~10x 单请求,
-            // 但避免客户端可见 429。
             let acquired = self
                 .account_svc
                 .acquire_slot(account.id, account.concurrency)
                 .await
-                .unwrap_or(false);
+                .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
             if !acquired {
-                if attempt < MAX_ATTEMPTS {
-                    crate::service::metrics::METRICS.record_gateway_rejected("account_slot_retry");
-                    warn!(
-                        "account {} → concurrency slot full, retry on another (attempt {}/{})",
-                        account.id, attempt, MAX_ATTEMPTS
-                    );
-                    excluded_for_retry.push(account.id);
-                    continue;
-                }
-                // 最后一次 attempt 也失败 → 真返客户端 (说明所有候选号都满了, 该限了)
                 return Err(AppError::TooManyRequests(
-                    "concurrency slot unavailable on all attempted accounts".into(),
+                    "concurrency slot unavailable".into(),
                 ));
             }
             cp!("slot_acquire");
@@ -667,65 +651,22 @@ impl GatewayService {
                 continue;
             }
 
-            // 401 → Anthropic 拒认 access_token (token 死了 / 被风控 invalidate)。
-            // OAuth refresh 看似成功但拿到的 token 不能用是常见现象, 不是 cc-bridge bug。
-            // 修法: mark auth_error 让该号立刻退出调度池 (categorize 归 Invalid),
-            //       retry 另一号救本次请求, 客户端不会看到 401。
-            // 最后一次 attempt 也 401 → 透传 (说明池里多个号都死了, 限不住)。
-            if status_code == 401 {
-                let aid = account.id;
-                let svc = self.account_svc.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = svc
-                        .mark_auth_error(aid, "Invalid auth credentials (401)")
-                        .await
-                    {
-                        warn!("mark_auth_error account {}: {}", aid, e);
-                    }
-                });
-                warn!(
-                    "account {} → 401 invalid auth, mark invalid + retry (attempt {}/{})",
-                    account.id, attempt, MAX_ATTEMPTS
-                );
-                if attempt < MAX_ATTEMPTS {
-                    let _ = axum::body::to_bytes(resp.into_body(), 64 * 1024).await;
-                    excluded_for_retry.push(account.id);
-                    continue;
-                }
-            }
-
             if status != StatusCode::TOO_MANY_REQUESTS {
                 perf_log(&rid, "total", t_start.elapsed().as_secs_f64() * 1000.0);
                 break resp;
             }
 
-            // 429 处理 (v1.9.16):
-            //   - Sonnet 配额 429: sticky 透传, 不 retry (Anthropic 自己说 sonnet quota 满,
-            //     换号也是 7d 子 quota 慢恢复, 没意义)
-            //   - 其他 429 (RPM/TPM burst 短期限流, 5h/7d 总窗口) → retry 另一号
-            //     场景: bot/agent 高 RPM 持续撞同一 sticky 号, Anthropic 给 60s 短期 ban
-            //     之前 sticky preserve 死锁 -> 客户持续看 429。 retry 后 sticky 仍被
-            //     account_svc 内部 evict (见 v1.9.16 B), 后续请求路由到新号。
-            //     代价: 该次请求 cache miss (新号无 prompt 缓存) → 该次成本 ~10x。
-            //     收益: 客户端少看 429。商用换体验值得。
+            // 429 黏性透传：不切号、不 retry，把原 body 替换为通用文案后返回给客户端。
+            // absorb_headers 已在 forward_request 里执行，state 更新后续请求会自动避开。
+            // 不 retry 原因: 换号 = 新号无 prompt cache → 该请求成本 ~10x。代价 > 客户端体验。
             if crate::service::limit::is_sonnet_rejection(resp.headers()) {
                 info!(
                     "account {} returned 429 for sonnet quota (sticky, no retry)",
                     account.id
                 );
-                break wrap_429_response(resp);
+            } else {
+                warn!("account {} returned 429 (sticky, no retry)", account.id);
             }
-            if attempt < MAX_ATTEMPTS {
-                warn!(
-                    "account {} returned 429, retry on another (attempt {}/{})",
-                    account.id, attempt, MAX_ATTEMPTS
-                );
-                // 消费 body 释放 slot
-                let _ = axum::body::to_bytes(resp.into_body(), 64 * 1024).await;
-                excluded_for_retry.push(account.id);
-                continue;
-            }
-            warn!("account {} returned 429, last attempt also failed (sticky, returned to client)", account.id);
             break wrap_429_response(resp);
         };
 
