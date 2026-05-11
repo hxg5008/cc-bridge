@@ -510,11 +510,19 @@ impl AccountService {
         // 1. status=disabled → 封禁 vs 停用 (按 disable_reason 文本区分)
         if account.status == AccountStatus::Disabled {
             let reason = account.disable_reason.as_str();
-            // 与 gateway.rs 写入的字面量保持一致: "403 认证失败"
+            // 与 gateway.rs 写入的字面量保持一致:
+            //   - "403 认证失败"           (v1.8.x 旧)
+            //   - "403 认证失败 (3次累计触顶)" (v1.9.7+ 软恢复触顶)
+            //   - "组织已被封禁 (400)"      (v1.9.8+ 400 org disabled)
+            // 这些都是上游主动封号 → Banned; 否则视为人工停用 → Stopped
+            let lower = reason.to_lowercase();
             let is_banned = reason.contains("403")
+                || reason.contains("400")
                 || reason.contains("认证失败")
-                || reason.to_lowercase().contains("violation")
-                || reason.to_lowercase().contains("forbidden");
+                || reason.contains("封禁")
+                || lower.contains("violation")
+                || lower.contains("forbidden")
+                || lower.contains("disabled");
             if is_banned {
                 return AccountCategorization {
                     category: AccountCategory::Banned,
