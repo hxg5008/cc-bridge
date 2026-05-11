@@ -464,14 +464,30 @@ impl GatewayService {
             }
 
             // 获取并发槽位 (account-level)
+            // v1.9.15: acquire 失败时 retry 到另一个号 (而不是直接返客户端 429)。
+            // 场景: 多客户端同 prompt → sticky 全打到一个号 → 该号 concurrency 满 →
+            // 之前直接 429 返客户端 (用户报 "批量测试 6 个总有 429")。
+            // 158+ 空闲 slot 在其他号上, retry 一次几乎必中。
+            // 代价: 该次 prompt cache miss (新号没该 prompt 缓存), 成本 ~10x 单请求,
+            // 但避免客户端可见 429。
             let acquired = self
                 .account_svc
                 .acquire_slot(account.id, account.concurrency)
                 .await
-                .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
+                .unwrap_or(false);
             if !acquired {
+                if attempt < MAX_ATTEMPTS {
+                    crate::service::metrics::METRICS.record_gateway_rejected("account_slot_retry");
+                    warn!(
+                        "account {} → concurrency slot full, retry on another (attempt {}/{})",
+                        account.id, attempt, MAX_ATTEMPTS
+                    );
+                    excluded_for_retry.push(account.id);
+                    continue;
+                }
+                // 最后一次 attempt 也失败 → 真返客户端 (说明所有候选号都满了, 该限了)
                 return Err(AppError::TooManyRequests(
-                    "concurrency slot unavailable".into(),
+                    "concurrency slot unavailable on all attempted accounts".into(),
                 ));
             }
             cp!("slot_acquire");
