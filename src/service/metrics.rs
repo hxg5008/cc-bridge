@@ -125,6 +125,11 @@ pub struct Counters {
     /// 商业告警: per_token_cap 持续 > 0 说明有客户端在打 burst
     pub gateway_rejected_by_reason: DashMap<&'static str, AtomicU64>,
 
+    /// 软恢复 cooldown 触发计数 — 收到 403 但未触阈, 设了 cooldown 跳过本号
+    pub anthropic_403_cooldown_set: AtomicU64,
+    /// 软恢复成功计数 — cooldown 后真实请求拿到 2xx, 清空 strikes
+    pub anthropic_403_recovery: AtomicU64,
+
     // 启动时间 (gauge, 一次性写入, 用于计算 uptime)
     pub started_at_unix: AtomicI64,
 }
@@ -160,6 +165,8 @@ impl Counters {
             account_disabled_by_reason: DashMap::new(),
             circuit_breaker_events: DashMap::new(),
             gateway_rejected_by_reason: DashMap::new(),
+            anthropic_403_cooldown_set: AtomicU64::new(0),
+            anthropic_403_recovery: AtomicU64::new(0),
             started_at_unix: AtomicI64::new(0),
         }
     }
@@ -178,6 +185,16 @@ impl Counters {
             .entry(reason_label)
             .or_insert_with(|| AtomicU64::new(0));
         entry.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 软恢复 — 上游 403 但未达永久 disable 阈值时调用 (设 cooldown 跳过本号)
+    pub fn record_403_cooldown_set(&self) {
+        self.anthropic_403_cooldown_set.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 软恢复 — cooldown 后真实请求拿到 2xx, 清空 strikes 时调用
+    pub fn record_403_recovery(&self) {
+        self.anthropic_403_recovery.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Circuit breaker 状态变化 (修 N6): event ∈ {"open", "close"}

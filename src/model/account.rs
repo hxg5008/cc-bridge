@@ -233,6 +233,28 @@ impl Account {
             .map(|expires_at| expires_at > Utc::now() + chrono::Duration::seconds(buffer_seconds))
             .unwrap_or(false)
     }
+
+    /// 软恢复机制 — 上游 403 后短期 cooldown 而非立刻永久 disable。
+    /// 状态字段塞 [`Self::extra`] JSONB,无 schema 改动。
+    /// `auth_403_cooldown_until` > now 期间调度器跳过该号;到期自然恢复。
+    pub fn is_in_403_cooldown(&self) -> bool {
+        self.extra
+            .get("auth_403_cooldown_until")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt > Utc::now())
+            .unwrap_or(false)
+    }
+
+    /// 是否有未清零的 403 计数 (用于 success 响应判断要不要发清零写)。
+    pub fn has_403_strikes(&self) -> bool {
+        self.extra
+            .get("auth_403_count")
+            .and_then(|v| v.as_u64())
+            .map(|n| n > 0)
+            .unwrap_or(false)
+            || self.extra.get("auth_403_cooldown_until").is_some()
+    }
 }
 
 /// 存储 20+ 维度的环境指纹数据。

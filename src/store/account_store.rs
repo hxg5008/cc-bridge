@@ -459,6 +459,25 @@ impl AccountStore {
         Ok(())
     }
 
+    /// 软恢复机制 — 仅写 extra 一列。invalidate schedulable cache 让 cooldown
+    /// 写入立刻对调度器生效。
+    pub async fn update_extra(&self, id: i64, extra: serde_json::Value) -> Result<(), AppError> {
+        let extra_str = serde_json::to_string(&extra).map_err(|e| {
+            AppError::Internal(format!("serialize extra: {}", e))
+        })?;
+        let q = format!(
+            "UPDATE accounts SET extra=$1, updated_at={} WHERE id=$2",
+            self.now_expr()
+        );
+        sqlx::query(&q)
+            .bind(extra_str)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.invalidate_schedulable_cache().await;
+        Ok(())
+    }
+
     /// 一次性清理：Phase 1 前由旧限流路径写入 status='active' 账号上的残留字段。
     /// 手动停用（status='disabled'）的账号不动。幂等：清完后二次运行无副作用。
     pub async fn clear_stale_rate_limit_fields(&self) -> Result<u64, AppError> {

@@ -12,7 +12,7 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::error::AppError;
-use crate::model::account::{Account, AccountStatus};
+use crate::model::account::Account;
 use crate::model::api_token::ApiToken;
 use crate::service::account::AccountService;
 use crate::service::rewriter::{
@@ -551,6 +551,17 @@ impl GatewayService {
             self.limit_store.record_upstream_5xx(account.id);
         } else if status.is_success() {
             self.limit_store.record_upstream_success(account.id);
+            // 软恢复路径 — 真实成功响应才清 403 计数 (test/usage 按钮不走这, 它们
+            // 即使在号 ck 失效时也可能返 200, 不能用作恢复信号)
+            if account.has_403_strikes() {
+                let svc = self.account_svc.clone();
+                let aid = account.id;
+                tokio::spawn(async move {
+                    if let Err(e) = svc.clear_403_state(aid).await {
+                        warn!("clear_403_state account {}: {}", aid, e);
+                    }
+                });
+            }
         }
 
         // 5xx 黏性透传：wrap body 为通用 api_error，剥离请求追踪头。
@@ -651,16 +662,12 @@ impl GatewayService {
         let status_code = resp.status().as_u16();
         debug!("upstream response: {}", status_code);
 
-        // 处理认证失败：403 永久停用
+        // 处理认证失败:403 走软恢复 (累计 < 阈值 → cooldown 24h, 否则永久 disable)
+        // 旧行为 "1 次 403 = 永久 disable" 改成 "3 次 403 (7d 滚动窗) 才永久 disable",
+        // 因 Anthropic organization 临时风控通常 24h 自愈, 一次性误杀不再可接受。
         if status_code == 403 {
-            if let Err(e) = self
-                .account_svc
-                .disable_account(account.id, AccountStatus::Disabled, "403 认证失败", None)
-                .await
-            {
-                warn!("failed to disable account {} for 403: {}", account.id, e);
-            } else {
-                warn!("account {} permanently disabled for 403", account.id);
+            if let Err(e) = self.account_svc.record_403(account.id).await {
+                warn!("record_403 for account {}: {}", account.id, e);
             }
         }
 

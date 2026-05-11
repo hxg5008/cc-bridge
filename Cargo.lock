@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "claude-code-gateway"
-version = "1.9.6"
+version = "1.9.7"
 dependencies = [
  "async-stream",
  "axum",

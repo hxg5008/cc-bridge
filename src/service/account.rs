@@ -211,15 +211,17 @@ impl AccountService {
                         } else {
                             self.limit_store.availability(account_id).is_available()
                         };
+                        let cooldown_ok = !account.is_in_403_cooldown();
                         if account.is_schedulable()
                             && !exclude_ids.contains(&account_id)
                             && id_allowed
                             && rate_limit_ok
+                            && cooldown_ok
                         {
                             return Ok(account);
                         }
                         // 校验失败：判断是临时还是永久
-                        // 账号本身正常（schedulable + 通过权限）但只是被限流 → 临时，保留 sticky
+                        // 账号本身正常（schedulable + 通过权限）但只是被限流 / 403 cooldown → 临时，保留 sticky
                         // 否则（账号挂了 / 被黑名单）→ 永久，删 sticky
                         if account.is_schedulable()
                             && id_allowed
@@ -275,6 +277,12 @@ impl AccountService {
                     return false;
                 }
                 if !(allowed_ids.is_empty() || allowed_ids.contains(&a.id)) {
+                    return false;
+                }
+                // 软恢复 cooldown 检查 — 与 LimitStore 限流同等处理 (一并算 limited_out
+                // 让上层 sticky 路径走 "preserved" 分支保留首选)
+                if a.is_in_403_cooldown() {
+                    limited_out.push(a.id);
                     return false;
                 }
                 if skip_rate_limit_filter {
@@ -888,6 +896,139 @@ impl AccountService {
 
     pub async fn enable_account(&self, id: i64) -> Result<(), AppError> {
         self.store.enable_account(id).await
+    }
+
+    /// 上游 403 软恢复 — 累积计数 + 短期 cooldown,达阈值才永久 disable。
+    ///
+    /// 触发位置: `gateway.rs` 收到上游 403 时调用 (替代直接 disable_account)。
+    /// 状态字段全塞 `account.extra` JSONB,无 schema 改动。
+    ///
+    /// 行为:
+    /// - 拉账号当前 extra,读 `auth_403_first_at` / `auth_403_count`
+    /// - 7d 滚动窗口外 → 重置 first_at, count = 1
+    /// - 窗口内 → count += 1
+    /// - count < threshold → 写 cooldown_until = now + COOLDOWN_SECS, 调度器跳过
+    /// - count >= threshold → 调用现有 `disable_account` 永久 disable (行为不变)
+    ///
+    /// env 调参 (默认值匹配 Anthropic 组织级临时风控通常 24h 才解的实际经验):
+    /// - `CCBRIDGE_403_COOLDOWN_SECS` 默认 86400 (24h)
+    /// - `CCBRIDGE_403_STRIKE_THRESHOLD` 默认 3
+    /// - `CCBRIDGE_403_WINDOW_DAYS` 默认 7
+    pub async fn record_403(&self, account_id: i64) -> Result<(), AppError> {
+        let cooldown_secs: i64 = std::env::var("CCBRIDGE_403_COOLDOWN_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &i64| *n > 0)
+            .unwrap_or(86400);
+        let threshold: u64 = std::env::var("CCBRIDGE_403_STRIKE_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &u64| *n > 0)
+            .unwrap_or(3);
+        let window_days: i64 = std::env::var("CCBRIDGE_403_WINDOW_DAYS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &i64| *n > 0)
+            .unwrap_or(7);
+
+        let account = self.store.get_by_id(account_id).await?;
+        let now = Utc::now();
+
+        let mut extra = account
+            .extra
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+
+        // 7d 滚动窗判断: first_at 超出窗口或没有 → 视为新一轮,重置
+        let first_at = extra
+            .get("auth_403_first_at")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        let in_window = first_at
+            .map(|t| (now - t).num_days() < window_days)
+            .unwrap_or(false);
+
+        let count: u64 = if in_window {
+            extra
+                .get("auth_403_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                + 1
+        } else {
+            extra.insert(
+                "auth_403_first_at".into(),
+                serde_json::Value::String(now.to_rfc3339()),
+            );
+            1
+        };
+        extra.insert(
+            "auth_403_count".into(),
+            serde_json::Value::Number(count.into()),
+        );
+
+        if count >= threshold {
+            // 触顶 → 永久 disable, 走现有路径 (含 metrics + cache invalidate)
+            // 顺带把 cooldown 字段清掉, disabled 状态本身已经使账号不可调度
+            extra.remove("auth_403_cooldown_until");
+            // 先把 extra 落 (含累积计数, 便于运维看历史)
+            let _ = self
+                .store
+                .update_extra(account_id, serde_json::Value::Object(extra))
+                .await;
+            self.disable_account(
+                account_id,
+                crate::model::account::AccountStatus::Disabled,
+                &format!("403 认证失败 ({}次累计触顶)", count),
+                None,
+            )
+            .await?;
+            warn!(
+                "account {} → 403 strike {}/{} → permanently disabled",
+                account_id, count, threshold
+            );
+        } else {
+            let until = now + chrono::Duration::seconds(cooldown_secs);
+            extra.insert(
+                "auth_403_cooldown_until".into(),
+                serde_json::Value::String(until.to_rfc3339()),
+            );
+            self.store
+                .update_extra(account_id, serde_json::Value::Object(extra))
+                .await?;
+            crate::service::metrics::METRICS.record_403_cooldown_set();
+            info!(
+                "account {} → 403 strike {}/{} → cooldown {}s (until {})",
+                account_id, count, threshold, cooldown_secs, until
+            );
+        }
+        Ok(())
+    }
+
+    /// 成功响应路径调用 — 清空 403 计数 + cooldown 字段。
+    /// 调用方应该先用 `account.has_403_strikes()` 判断,避免无意义的 DB 写。
+    pub async fn clear_403_state(&self, account_id: i64) -> Result<(), AppError> {
+        let account = self.store.get_by_id(account_id).await?;
+        let mut extra = match account.extra.as_object() {
+            Some(o)
+                if o.contains_key("auth_403_count")
+                    || o.contains_key("auth_403_cooldown_until")
+                    || o.contains_key("auth_403_first_at") =>
+            {
+                o.clone()
+            }
+            _ => return Ok(()),
+        };
+        extra.remove("auth_403_count");
+        extra.remove("auth_403_first_at");
+        extra.remove("auth_403_cooldown_until");
+        self.store
+            .update_extra(account_id, serde_json::Value::Object(extra))
+            .await?;
+        crate::service::metrics::METRICS.record_403_recovery();
+        info!("account {} → 403 state cleared (success after strikes)", account_id);
+        Ok(())
     }
 
     /// 获取 OpenAI OAuth 账号最新 access_token,带全局刷新锁防 thundering herd。
