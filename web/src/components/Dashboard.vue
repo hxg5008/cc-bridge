@@ -9,6 +9,9 @@ import { logout } from '../router';
 const route = useRoute();
 const router = useRouter();
 
+/** 后端版本号 (vite 构建时注入, 来自 cc-bridge-merged/.version) */
+const appVersion = __APP_VERSION__;
+
 /** 仪表盘统计数据 */
 const dashboard = ref<DashboardData | null>(null);
 
@@ -87,7 +90,10 @@ onMounted(loadDashboard);
         <div class="flex items-center gap-6">
           <div class="flex items-center gap-2">
             <img src="/favicon.svg" alt="Logo" class="w-6 h-6" />
-            <h1 class="text-lg font-semibold text-[#29261e] tracking-tight">cc-bridge</h1>
+            <h1 class="text-lg font-semibold text-[#29261e] tracking-tight">
+              cc-bridge
+              <span class="text-xs font-normal text-[#8c8475] ml-1">v{{ appVersion }}</span>
+            </h1>
           </div>
           <nav class="flex items-center gap-1">
             <router-link

@@ -460,13 +460,16 @@ impl AccountStore {
     }
 
     /// 软恢复机制 — 仅写 extra 一列。invalidate schedulable cache 让 cooldown
-    /// 写入立刻对调度器生效。
+    /// 写入立刻对调度器生效。注意 extra 是 jsonb 列, sqlx Any driver 不会自动从
+    /// TEXT cast 到 JSONB, 必须用 self.jsonb($N) 显式 cast (v1.9.7→v1.9.8 漏修,
+    /// 导致 record_403 全部失败 → cooldown / strikes 写不进去)。
     pub async fn update_extra(&self, id: i64, extra: serde_json::Value) -> Result<(), AppError> {
         let extra_str = serde_json::to_string(&extra).map_err(|e| {
             AppError::Internal(format!("serialize extra: {}", e))
         })?;
         let q = format!(
-            "UPDATE accounts SET extra=$1, updated_at={} WHERE id=$2",
+            "UPDATE accounts SET extra={}, updated_at={} WHERE id=$2",
+            self.jsonb(1),
             self.now_expr()
         );
         sqlx::query(&q)

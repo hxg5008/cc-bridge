@@ -5,6 +5,9 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { login } from '../router';
 
+/** 后端版本号 (vite 构建时注入) */
+const appVersion = __APP_VERSION__;
+
 /** 密码输入值 */
 const password = ref('');
 /** 错误信息 */
@@ -37,7 +40,10 @@ async function submit() {
         <div class="flex justify-center mb-2">
           <img src="/favicon.svg" alt="Logo" class="w-10 h-10" />
         </div>
-        <CardTitle class="text-2xl font-semibold text-[#29261e] tracking-tight">cc-bridge</CardTitle>
+        <CardTitle class="text-2xl font-semibold text-[#29261e] tracking-tight">
+          cc-bridge
+          <span class="text-sm font-normal text-[#8c8475] ml-1">v{{ appVersion }}</span>
+        </CardTitle>
         <p class="text-[#8c8475] text-sm mt-1">管理控制台</p>
       </CardHeader>
       <CardContent>
