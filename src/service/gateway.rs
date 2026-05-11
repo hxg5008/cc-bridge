@@ -667,6 +667,33 @@ impl GatewayService {
                 continue;
             }
 
+            // 401 → Anthropic 拒认 access_token (token 死了 / 被风控 invalidate)。
+            // OAuth refresh 看似成功但拿到的 token 不能用是常见现象, 不是 cc-bridge bug。
+            // 修法: mark auth_error 让该号立刻退出调度池 (categorize 归 Invalid),
+            //       retry 另一号救本次请求, 客户端不会看到 401。
+            // 最后一次 attempt 也 401 → 透传 (说明池里多个号都死了, 限不住)。
+            if status_code == 401 {
+                let aid = account.id;
+                let svc = self.account_svc.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = svc
+                        .mark_auth_error(aid, "Invalid auth credentials (401)")
+                        .await
+                    {
+                        warn!("mark_auth_error account {}: {}", aid, e);
+                    }
+                });
+                warn!(
+                    "account {} → 401 invalid auth, mark invalid + retry (attempt {}/{})",
+                    account.id, attempt, MAX_ATTEMPTS
+                );
+                if attempt < MAX_ATTEMPTS {
+                    let _ = axum::body::to_bytes(resp.into_body(), 64 * 1024).await;
+                    excluded_for_retry.push(account.id);
+                    continue;
+                }
+            }
+
             if status != StatusCode::TOO_MANY_REQUESTS {
                 perf_log(&rid, "total", t_start.elapsed().as_secs_f64() * 1000.0);
                 break resp;

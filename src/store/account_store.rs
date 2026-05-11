@@ -376,6 +376,9 @@ impl AccountStore {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        // v1.9.18: auth_error 改变 → 影响 categorize / select_account 候选,
+        // 必须 invalidate cache 让下次 select_account 立刻看到新状态。
+        self.invalidate_schedulable_cache().await;
         Ok(())
     }
 

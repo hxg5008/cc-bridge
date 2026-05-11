@@ -219,22 +219,25 @@ impl AccountService {
                             self.limit_store.availability(account_id).is_available()
                         };
                         let cooldown_ok = !account.is_in_403_cooldown();
+                        let auth_ok = account.auth_error.is_empty();
                         if account.is_schedulable()
                             && !exclude_ids.contains(&account_id)
                             && id_allowed
                             && rate_limit_ok
                             && cooldown_ok
+                            && auth_ok
                         {
                             // v1.9.16 B: sticky 命中成功 → 清掉 burst 计数 (避免长期累积)
                             self.sticky_burst_count.remove(session_hash);
                             return Ok(account);
                         }
                         // 校验失败：判断是临时还是永久
-                        // 账号本身正常（schedulable + 通过权限）但只是被限流 / 403 cooldown → 临时，保留 sticky
-                        // 否则（账号挂了 / 被黑名单）→ 永久，删 sticky
+                        // 账号本身正常（schedulable + 通过权限 + 无 auth 错）但只是被限流 / 403 cooldown → 临时，保留 sticky
+                        // 否则（账号挂了 / 被黑名单 / auth_error 非空）→ 永久，删 sticky
                         if account.is_schedulable()
                             && id_allowed
                             && !exclude_ids.contains(&account_id)
+                            && account.auth_error.is_empty()
                         {
                             // v1.9.16 B: sticky burst-evict 检测
                             // 同 session_hash 短时间内反复被 preserve = 客户高 RPM 持续撞限流号,
@@ -327,6 +330,12 @@ impl AccountService {
                 // 让上层 sticky 路径走 "preserved" 分支保留首选)
                 if a.is_in_403_cooldown() {
                     limited_out.push(a.id);
+                    return false;
+                }
+                // v1.9.18: invalid 号 (auth_error 非空) 不调度。
+                // gateway 401 handler 会标 auth_error, 标了就立刻退出调度池。
+                // 这一行是兜底过滤 — 防止 sticky 路径漏过去。
+                if !a.auth_error.is_empty() {
                     return false;
                 }
                 if skip_rate_limit_filter {
@@ -717,7 +726,25 @@ impl AccountService {
                         id, e
                     );
                 } else {
-                    warn!("refresh_usage: account {} → upstream error: {}", id, e);
+                    // v1.9.18: usage 接口返 401 = Anthropic 拒认 token, 跟 gateway 一样
+                    // 标 auth_error 让该号退出调度。 把整个 error string 拿来匹配 401。
+                    let err_str = format!("{}", e);
+                    if err_str.contains("401") || err_str.contains("Invalid authentication credentials") {
+                        if let Err(me) = self
+                            .store
+                            .update_auth_error(id, "Invalid auth credentials (401 from usage)")
+                            .await
+                        {
+                            warn!("update_auth_error account {}: {}", id, me);
+                        } else {
+                            warn!(
+                                "refresh_usage: account {} → upstream 401, marked invalid",
+                                id
+                            );
+                        }
+                    } else {
+                        warn!("refresh_usage: account {} → upstream error: {}", id, e);
+                    }
                 }
                 Err(e)
             }
@@ -969,6 +996,15 @@ impl AccountService {
 
     pub async fn enable_account(&self, id: i64) -> Result<(), AppError> {
         self.store.enable_account(id).await
+    }
+
+    /// 标记账号 OAuth 失效 (auth_error 非空 → categorize 归 Invalid)。
+    /// 触发点: gateway 收到 401 / refresh_usage 收到 401 / oauth_refresh invalid_grant。
+    /// 注意: 不动 status (保持 active), 因为 Anthropic 临时风控有时会解除,
+    /// 用户手动点"测试"刷新 token 可清除 auth_error 让号重回调度池。
+    /// update_auth_error 内部已 invalidate schedulable cache。
+    pub async fn mark_auth_error(&self, account_id: i64, error: &str) -> Result<(), AppError> {
+        self.store.update_auth_error(account_id, error).await
     }
 
     /// 上游 403 软恢复 — 累积计数 + 短期 cooldown,达阈值才永久 disable。
