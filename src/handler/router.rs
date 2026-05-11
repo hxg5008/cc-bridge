@@ -688,7 +688,10 @@ async fn list_accounts(
     Query(query): Query<PageQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let page = query.page.unwrap_or(1).max(1);
-    let page_size = query.page_size.unwrap_or(12).clamp(1, 100);
+    // clamp 上限 1000: 商用账号池 1000 内仍可一次拉全, 让前端做 client-side filter/分页;
+    // > 1000 用户得乖乖分页 (避免一次响应太大)。原来上限 100 在 121 个号场景下分页 +
+    // 前端 client-side filter 不一致 (banned 在第 N 页, 当前页过滤看不到)。
+    let page_size = query.page_size.unwrap_or(12).clamp(1, 1000);
     let (accounts, total) = state
         .account_svc
         .list_accounts_paged(page, page_size)

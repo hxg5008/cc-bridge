@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { api, type Account, type AccountCategory, type OAuthExchangeResult, type OpenAITokenInfo, type UsageData } from '../api';
 import { Card } from '@/components/ui/card';
@@ -16,24 +16,21 @@ import { useToast } from '../composables/useToast';
 const emit = defineEmits<{ refresh: [] }>();
 const { show: toast } = useToast();
 
-/** 账号列表 */
+/** 账号列表 (一次拉全, client-side 过滤 + 分页) */
 const accounts = ref<Account[]>([]);
-/** 分页状态 */
+/** client-side 分页状态 */
 const currentPage = ref(1);
-const totalPages = ref(1);
-const totalCount = ref(0);
 /** 视图模式: 'detail' = 现有卡片详情视图, 'compact' = 表格紧凑视图 (大量账号场景) */
 const viewMode = ref<'detail' | 'compact'>(
   (localStorage.getItem('cc-bridge.view_mode') as 'detail' | 'compact') || 'detail',
 );
-/** pageSize 自适应: detail 12 / compact 50 */
+/** 每页显示数: detail 12 / compact 50 (client-side 切片) */
 const pageSize = computed(() => (viewMode.value === 'compact' ? 50 : 12));
 function onViewModeChange(mode: 'detail' | 'compact') {
   if (viewMode.value === mode) return;
   viewMode.value = mode;
   localStorage.setItem('cc-bridge.view_mode', mode);
   currentPage.value = 1; // 切换视图重置到第 1 页, 因 pageSize 变了
-  load();
 }
 /** 关键字搜索 (前端 client-side, 按 email/name 过滤) */
 const searchQuery = ref<string>('');
@@ -78,6 +75,19 @@ const filteredAccounts = computed(() => {
     );
   }
   return list;
+});
+
+/** filter 变化时重置回第 1 页, 否则可能停在不存在的页 */
+watch([categoryFilter, platformFilter, subscriptionFilter, searchQuery], () => {
+  currentPage.value = 1;
+});
+
+/** 分页计算: 基于 filteredAccounts 切片 */
+const totalCount = computed(() => filteredAccounts.value.length);
+const totalPages = computed(() => Math.max(1, Math.ceil(totalCount.value / pageSize.value)));
+const pagedAccounts = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value;
+  return filteredAccounts.value.slice(start, start + pageSize.value);
 });
 
 /** 订阅档位 → 显示标签 (max5/max20/pro/free/...) */
@@ -184,23 +194,20 @@ const testResult = ref<{ status: string; message?: string } | null>(null);
 /** 正在刷新用量的账号 ID */
 const refreshingUsage = ref<number | null>(null);
 
-/** 加载账号列表 */
+/** 加载账号列表 — 一次拉全 (后端 page_size 上限 1000), client 端分页 + filter */
 async function load() {
   try {
-    const res = await api.listAccounts(currentPage.value, pageSize.value);
+    const res = await api.listAccounts(1, 1000);
     accounts.value = res.data ?? [];
-    totalPages.value = res.total_pages;
-    totalCount.value = res.total;
   } catch {
     accounts.value = [];
   }
 }
 
-/** 翻页 */
+/** 翻页 (client-side) */
 function goToPage(page: number) {
   if (page < 1 || page > totalPages.value) return;
   currentPage.value = page;
-  load();
 }
 
 /** 可见的页码列表 */
@@ -1321,7 +1328,7 @@ async function copyText(text: string) {
           </thead>
           <tbody>
             <tr
-              v-for="a in filteredAccounts"
+              v-for="a in pagedAccounts"
               :key="a.id"
               class="border-b border-[#f0ebe4] hover:bg-[#f9f6f1]/50 cursor-pointer transition-colors"
               :class="selectedIds.has(a.id) ? 'bg-amber-50/40' : ''"
@@ -1426,7 +1433,7 @@ async function copyText(text: string) {
     <!-- 详情视图: 卡片 (现有布局, 不动) -->
     <div v-else class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
       <Card
-        v-for="a in filteredAccounts"
+        v-for="a in pagedAccounts"
         :key="a.id"
         class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 overflow-hidden"
         :class="(a.status === 'disabled' || isRateLimited(a)) ? 'opacity-60' : ''"
