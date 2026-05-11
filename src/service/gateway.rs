@@ -401,199 +401,276 @@ impl GatewayService {
             .map(|m| m.to_ascii_lowercase().contains("sonnet"))
             .unwrap_or(false);
 
-        // 黏性透传策略：429 不再 retry 其它账号（换号会 bust prompt cache，成本爆炸）。
-        // 本次请求拿到 429 → 包装成通用错误 body 返回；后续并发请求由 absorb_headers
-        // 更新的 state.status / rate_limited_until 让 selector 自然避开此账号。
-        let account = match self
-            .account_svc
-            .select_account(&session_hash, &blocked_ids, &allowed_ids, is_sonnet_request)
-            .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                return Err(AppError::ServiceUnavailable(format!(
-                    "no available account: {}",
-                    e
-                )));
-            }
-        };
-        cp!("select_account");
+        // 黏性透传策略（v1.9.8 调整）:
+        //   - 5xx → 包装通用错误,不 retry (cache 优先)
+        //   - 429 → 包装通用错误,不 retry (cache 优先)
+        //   - 403 organization OAuth restriction → record_403 cooldown + retry 另一个号
+        //   - 400 organization has been disabled → 永久 disable + retry 另一个号
+        //   - 其他 4xx → 透传给客户端
+        // retry 最多 2 次, 防 5xx 风暴 → 雪崩。
+        const MAX_ATTEMPTS: u32 = 2;
+        let mut excluded_for_retry: Vec<i64> = Vec::new();
+        let mut attempt: u32 = 0;
 
-        // 自动遥测：拦截遥测请求 + 激活会话
-        if account.auto_telemetry {
-            use crate::service::telemetry::{
-                fake_metrics_enabled_response, fake_telemetry_response, is_telemetry_path,
-            };
+        let final_resp = loop {
+            attempt += 1;
 
-            if is_telemetry_path(&path) {
-                let body = if path.contains("/metrics_enabled") {
-                    fake_metrics_enabled_response()
-                } else {
-                    fake_telemetry_response()
-                };
-                debug!("telemetry: intercepted {} for account {}", path, account.id);
-                return Ok(axum::Json(body).into_response());
-            }
+            // 合并 api_token 黑名单 + 本次 retry 排除
+            let mut effective_block = blocked_ids.clone();
+            effective_block.extend(excluded_for_retry.iter().copied());
 
-            if path.starts_with("/v1/messages") {
-                let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
-                self.telemetry_svc
-                    .activate_session(&account, model_id)
-                    .await;
-            }
-        }
-
-        // 获取并发槽位 (account-level)
-        let acquired = self
-            .account_svc
-            .acquire_slot(account.id, account.concurrency)
-            .await
-            .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
-        if !acquired {
-            return Err(AppError::TooManyRequests(
-                "concurrency slot unavailable".into(),
-            ));
-        }
-        cp!("slot_acquire");
-
-        // SlotHolder 承载槽位所有权：SlotHeldStream 随 body 流结束/中断才释放；
-        // 429 包装时原 resp 被 drop → SlotHolder 也被 drop → 自动释放。
-        let mut slot = self.account_svc.slot_holder_for(account.id);
-
-        // 修 C1: 同时 acquire token-level concurrency slot, 防止单个 token
-        // 用 50 个并发请求把所有账号槽吃光 → 其他用户全部 503。
-        // 默认每 token 上限 20 in-flight, 可通过 env CCBRIDGE_TOKEN_CONCURRENCY 调整。
-        // 拿不到 → 立刻 429 + Retry-After (本 token 自己慢, 不影响其他 token)
-        if let Some(token) = api_token {
-            let token_max: i32 = std::env::var("CCBRIDGE_TOKEN_CONCURRENCY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|n: &i32| *n > 0)
-                .unwrap_or(20);
-            let tk_key = format!("tk:{}", token.id);
-            let cache = self.account_svc.cache();
-            // TTL 600s 兜底, 实际由 SlotHolder Drop 触发 release; 跟 account slot ttl 对齐
-            let tk_ok = cache
-                .acquire_slot(&tk_key, token_max, std::time::Duration::from_secs(600))
+            let account = match self
+                .account_svc
+                .select_account(
+                    &session_hash,
+                    &effective_block,
+                    &allowed_ids,
+                    is_sonnet_request,
+                )
                 .await
-                .unwrap_or(false);
-            if !tk_ok {
-                // 此时 account slot 已经拿到, slot 走 Drop 自动释放
-                crate::service::metrics::METRICS.record_gateway_rejected("per_token_cap");
-                return Err(AppError::TooManyRequests(format!(
-                    "per-token concurrency limit ({}) reached, please retry",
-                    token_max
-                )));
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    return Err(AppError::ServiceUnavailable(format!(
+                        "no available account: {}",
+                        e
+                    )));
+                }
+            };
+            cp!("select_account");
+
+            // 自动遥测：拦截遥测请求 + 激活会话
+            if account.auto_telemetry {
+                use crate::service::telemetry::{
+                    fake_metrics_enabled_response, fake_telemetry_response, is_telemetry_path,
+                };
+
+                if is_telemetry_path(&path) {
+                    let body = if path.contains("/metrics_enabled") {
+                        fake_metrics_enabled_response()
+                    } else {
+                        fake_telemetry_response()
+                    };
+                    debug!("telemetry: intercepted {} for account {}", path, account.id);
+                    return Ok(axum::Json(body).into_response());
+                }
+
+                if path.starts_with("/v1/messages") {
+                    let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
+                    self.telemetry_svc
+                        .activate_session(&account, model_id)
+                        .await;
+                }
             }
-            // 把 token slot 链到 account slot 上, 一起绑 SSE 流生命周期
-            let token_holder = SlotHolder::new(cache.clone(), tk_key);
-            slot = slot.chain_with(token_holder);
-        }
 
-        // 改写请求体
-        debug!(
-            "request body BEFORE rewrite: {}",
-            truncate_body(&body_bytes, 4096)
-        );
-        let rewritten_body = self
-            .rewriter
-            .rewrite_body(&body_bytes, &path, &account, client_type)?;
-        debug!(
-            "request body AFTER rewrite: {}",
-            truncate_body(&rewritten_body, 4096)
-        );
+            // 获取并发槽位 (account-level)
+            let acquired = self
+                .account_svc
+                .acquire_slot(account.id, account.concurrency)
+                .await
+                .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
+            if !acquired {
+                return Err(AppError::TooManyRequests(
+                    "concurrency slot unavailable".into(),
+                ));
+            }
+            cp!("slot_acquire");
 
-        let mut rewritten_body_map: serde_json::Value =
-            serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
+            // SlotHolder 承载槽位所有权：SlotHeldStream 随 body 流结束/中断才释放；
+            // 429 包装时原 resp 被 drop → SlotHolder 也被 drop → 自动释放。
+            let mut slot = self.account_svc.slot_holder_for(account.id);
 
-        let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
-        let rewritten_headers = self.rewriter.rewrite_headers(
-            &headers,
-            &account,
-            client_type,
-            model_id,
-            &rewritten_body_map,
-            &path,
-        );
+            // 修 C1: 同时 acquire token-level concurrency slot, 防止单个 token
+            // 用 50 个并发请求把所有账号槽吃光 → 其他用户全部 503。
+            // 默认每 token 上限 20 in-flight, 可通过 env CCBRIDGE_TOKEN_CONCURRENCY 调整。
+            // 拿不到 → 立刻 429 + Retry-After (本 token 自己慢, 不影响其他 token)
+            if let Some(token) = api_token {
+                let token_max: i32 = std::env::var("CCBRIDGE_TOKEN_CONCURRENCY")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|n: &i32| *n > 0)
+                    .unwrap_or(20);
+                let tk_key = format!("tk:{}", token.id);
+                let cache = self.account_svc.cache();
+                // TTL 600s 兜底, 实际由 SlotHolder Drop 触发 release; 跟 account slot ttl 对齐
+                let tk_ok = cache
+                    .acquire_slot(&tk_key, token_max, std::time::Duration::from_secs(600))
+                    .await
+                    .unwrap_or(false);
+                if !tk_ok {
+                    // 此时 account slot 已经拿到, slot 走 Drop 自动释放
+                    crate::service::metrics::METRICS.record_gateway_rejected("per_token_cap");
+                    return Err(AppError::TooManyRequests(format!(
+                        "per-token concurrency limit ({}) reached, please retry",
+                        token_max
+                    )));
+                }
+                // 把 token slot 链到 account slot 上, 一起绑 SSE 流生命周期
+                let token_holder = SlotHolder::new(cache.clone(), tk_key);
+                slot = slot.chain_with(token_holder);
+            }
 
-        let final_body = if client_type == ClientType::API {
-            clean_session_id_from_body(&mut rewritten_body_map);
-            serde_json::to_vec(&rewritten_body_map).unwrap_or_else(|_| rewritten_body.clone())
-        } else {
-            rewritten_body.clone()
-        };
-        cp!("rewrite");
+            // 改写请求体
+            debug!(
+                "request body BEFORE rewrite: {}",
+                truncate_body(&body_bytes, 4096)
+            );
+            let rewritten_body = self
+                .rewriter
+                .rewrite_body(&body_bytes, &path, &account, client_type)?;
+            debug!(
+                "request body AFTER rewrite: {}",
+                truncate_body(&rewritten_body, 4096)
+            );
 
-        let upstream_token = self.account_svc.resolve_upstream_token_with(&account).await?;
-        let mut final_headers = rewritten_headers;
-        final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
-        cp!("resolve_token");
+            let mut rewritten_body_map: serde_json::Value =
+                serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
 
-        let resp = self
-            .forward_request(
-                &method.to_string(),
-                &path,
-                &query,
-                &final_headers,
-                &final_body,
+            let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
+            let rewritten_headers = self.rewriter.rewrite_headers(
+                &headers,
                 &account,
-                slot,
-                &rid,
-            )
-            .await?;
-        cp!("forward_done");
+                client_type,
+                model_id,
+                &rewritten_body_map,
+                &path,
+            );
 
-        let status = resp.status();
+            let final_body = if client_type == ClientType::API {
+                clean_session_id_from_body(&mut rewritten_body_map);
+                serde_json::to_vec(&rewritten_body_map).unwrap_or_else(|_| rewritten_body.clone())
+            } else {
+                rewritten_body.clone()
+            };
+            cp!("rewrite");
 
-        // 修 C6: per-account circuit breaker — 5xx 累计 / 2xx 重置
-        // (4xx/429 不算"上游故障", 不计入)
-        if status.is_server_error() {
-            self.limit_store.record_upstream_5xx(account.id);
-        } else if status.is_success() {
-            self.limit_store.record_upstream_success(account.id);
-            // 软恢复路径 — 真实成功响应才清 403 计数 (test/usage 按钮不走这, 它们
-            // 即使在号 ck 失效时也可能返 200, 不能用作恢复信号)
-            if account.has_403_strikes() {
-                let svc = self.account_svc.clone();
-                let aid = account.id;
-                tokio::spawn(async move {
-                    if let Err(e) = svc.clear_403_state(aid).await {
-                        warn!("clear_403_state account {}: {}", aid, e);
-                    }
-                });
+            let upstream_token = self.account_svc.resolve_upstream_token_with(&account).await?;
+            let mut final_headers = rewritten_headers;
+            final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
+            cp!("resolve_token");
+
+            let resp = self
+                .forward_request(
+                    &method.to_string(),
+                    &path,
+                    &query,
+                    &final_headers,
+                    &final_body,
+                    &account,
+                    slot,
+                    &rid,
+                )
+                .await?;
+            cp!("forward_done");
+
+            let status = resp.status();
+            let status_code = status.as_u16();
+
+            // 修 C6: per-account circuit breaker — 5xx 累计 / 2xx 重置
+            // (4xx/429 不算"上游故障", 不计入)
+            if status.is_server_error() {
+                self.limit_store.record_upstream_5xx(account.id);
+            } else if status.is_success() {
+                self.limit_store.record_upstream_success(account.id);
+                // 软恢复路径 — 真实成功响应才清 403 计数 (test/usage 按钮不走这, 它们
+                // 即使在号 ck 失效时也可能返 200, 不能用作恢复信号)
+                if account.has_403_strikes() {
+                    let svc = self.account_svc.clone();
+                    let aid = account.id;
+                    tokio::spawn(async move {
+                        if let Err(e) = svc.clear_403_state(aid).await {
+                            warn!("clear_403_state account {}: {}", aid, e);
+                        }
+                    });
+                }
             }
-        }
 
-        // 5xx 黏性透传：wrap body 为通用 api_error，剥离请求追踪头。
-        // 避免把上游堆栈 / 请求 ID / 基础设施信息泄漏给下游客户端。
-        if status.is_server_error() {
-            warn!(
-                "account {} returned {} (wrapped, no retry)",
-                account.id,
-                status.as_u16()
-            );
-            return Ok(wrap_5xx_response(resp));
-        }
+            // 5xx 黏性透传：wrap body 为通用 api_error，剥离请求追踪头。
+            // 避免把上游堆栈 / 请求 ID / 基础设施信息泄漏给下游客户端。
+            // 不 retry: 5xx 多为上游真故障, retry 只会复制故障到第二个号 → 雪崩。
+            if status.is_server_error() {
+                warn!(
+                    "account {} returned {} (wrapped, no retry)",
+                    account.id,
+                    status_code
+                );
+                break wrap_5xx_response(resp);
+            }
 
-        if status != StatusCode::TOO_MANY_REQUESTS {
-            perf_log(&rid, "total", t_start.elapsed().as_secs_f64() * 1000.0);
-            return Ok(resp);
-        }
+            // 400 → 检测 organization has been disabled (永久封号), retry 另一个号。
+            // 其他 400 (客户端真错误) → 直接透传, 不 retry。
+            if status_code == 400 {
+                let (parts, body) = resp.into_parts();
+                let bytes = axum::body::to_bytes(body, 64 * 1024)
+                    .await
+                    .unwrap_or_default();
+                let body_str = std::str::from_utf8(&bytes).unwrap_or("");
+                if is_org_disabled_400(body_str) {
+                    warn!(
+                        "account {} → 400 org disabled, permanent disable (attempt {}/{})",
+                        account.id, attempt, MAX_ATTEMPTS
+                    );
+                    if let Err(e) = self
+                        .account_svc
+                        .disable_account(
+                            account.id,
+                            crate::model::account::AccountStatus::Disabled,
+                            "组织已被封禁 (400)",
+                            None,
+                        )
+                        .await
+                    {
+                        warn!("disable_account {}: {}", account.id, e);
+                    }
+                    if attempt < MAX_ATTEMPTS {
+                        excluded_for_retry.push(account.id);
+                        continue;
+                    }
+                    // 最后一次 attempt 也失败 → 透传给客户端 (反正其他号也没救)
+                }
+                // 普通 400 (或 org-disabled 已耗尽 retry 次数) → 重建 axum::Response 透传
+                let mut builder = Response::builder().status(parts.status);
+                for (k, v) in parts.headers.iter() {
+                    builder = builder.header(k.clone(), v.clone());
+                }
+                break builder
+                    .body(axum::body::Body::from(bytes))
+                    .map_err(|e| AppError::Internal(format!("rebuild 400: {}", e)))?;
+            }
 
-        // 429 黏性透传：不切号、不 retry，把原 body 替换为通用文案后返回给客户端。
-        // absorb_headers 已在 forward_request 里执行，state 更新后续请求会自动避开。
-        if crate::service::limit::is_sonnet_rejection(resp.headers()) {
-            info!(
-                "account {} returned 429 for sonnet quota (sticky, no retry)",
-                account.id
-            );
-        } else {
-            warn!(
-                "account {} returned 429 (sticky, no retry)",
-                account.id
-            );
-        }
-        Ok(wrap_429_response(resp))
+            // 403 → record_403 在 forward_request 里已调用 (cooldown 已设);
+            // 这里 retry 另一个号,让本次客户端请求成功率高一些。
+            if status_code == 403 && attempt < MAX_ATTEMPTS {
+                warn!(
+                    "account {} → 403, retry on another (attempt {}/{})",
+                    account.id, attempt, MAX_ATTEMPTS
+                );
+                // 消费 body 释放 slot, 不需要内容
+                let _ = axum::body::to_bytes(resp.into_body(), 64 * 1024).await;
+                excluded_for_retry.push(account.id);
+                continue;
+            }
+
+            if status != StatusCode::TOO_MANY_REQUESTS {
+                perf_log(&rid, "total", t_start.elapsed().as_secs_f64() * 1000.0);
+                break resp;
+            }
+
+            // 429 黏性透传：不切号、不 retry，把原 body 替换为通用文案后返回给客户端。
+            // absorb_headers 已在 forward_request 里执行，state 更新后续请求会自动避开。
+            // 不 retry 原因: 换号 = 新号无 prompt cache → 该请求成本 ~10x。代价 > 客户端体验。
+            if crate::service::limit::is_sonnet_rejection(resp.headers()) {
+                info!(
+                    "account {} returned 429 for sonnet quota (sticky, no retry)",
+                    account.id
+                );
+            } else {
+                warn!("account {} returned 429 (sticky, no retry)", account.id);
+            }
+            break wrap_429_response(resp);
+        };
+
+        Ok(final_resp)
     }
 
     async fn forward_request(
@@ -722,6 +799,16 @@ fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, Str
         }
     }
     map
+}
+
+/// Anthropic 400 响应里组织被永久封禁的标识。命中 → retry 到另一个号 + 把
+/// 当前号永久 disable。匹配宽松一点(case-insensitive + 多种措辞), 但只覆盖
+/// 已知组织级封号文案,不要泛化到所有 400 (普通 400 是客户端错误,不能 retry)。
+fn is_org_disabled_400(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("organization has been disabled")
+        || lower.contains("organization is disabled")
+        || lower.contains("organization_disabled")
 }
 
 /// Claude Code 主动扫描响应头检测 AI Gateway/代理（src/services/api/logging.ts）。

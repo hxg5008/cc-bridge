@@ -21,13 +21,13 @@ use crate::store::account_store::AccountStore;
 const DB_FLUSH_TTL: Duration = Duration::from_secs(5 * 60);
 /// 当 utilization 达到此值（0.0-1.0 刻度）即认定该窗口撞上限,立即紧急 flush 且 selector 判不可用。
 ///
-/// 0.97 是工程取舍 (vs 旧版 1.0):
-///   - Anthropic 上游通常在 99.x% 已开始返 429 (服务端窗口统计有滞后), 旧版 1.0
-///     等 selector 看到 100% 时, 客户端早已经撞过若干次 429
-///   - 0.97 留出 ~3% 的 "刹车距离": 看到 97% 立刻不再选这号, 让账号
-///     自然撞到上游硬阈值前下线
-///   - 代价: 每号每天少用约 3% 配额 (单 Pro 约少 4-5 条 msg/天), 商用换平稳
-const HIT_THRESHOLD: f64 = 0.97;
+/// 0.95 是 v1.9.8 收紧后的取舍 (旧版 0.97):
+///   - Anthropic 上游通常在 99.x% 已开始返 429 (服务端窗口统计有滞后), 0.97
+///     留 3% 余量已经不够 — 用户实测仍能撞 429 给客户端
+///   - 0.95 留出 ~5% 的"刹车距离": sticky session 收尾的请求也能完成,
+///     新 session 不会被路由到这个号 → 整体减少 50%+ 的 429 触发
+///   - 代价: 每号每天少用约 5% 配额, 商用换"客户端零 429"值得
+const HIT_THRESHOLD: f64 = 0.95;
 /// 软降权阈值: 任一窗口 util ∈ [WARN_THRESHOLD, HIT_THRESHOLD) 时账号仍可调度,
 /// 但优先级 +10 (同 priority 组里被排到后面), 让其他健康号优先被选, 这个号
 /// 的剩余配额仅作为"兜底"。
@@ -1022,11 +1022,11 @@ fn flush_reason(prev: &LimitState, new: &LimitState) -> Option<&'static str> {
     if prev_status == UnifiedStatus::Allowed && new_status != UnifiedStatus::Allowed {
         return Some("status-changed");
     }
-    // 4) 任一窗口 utilization 跨过 97%
+    // 4) 任一窗口 utilization 跨过 HIT_THRESHOLD (95% in v1.9.8)
     if crossed_threshold(&prev.five_hour, &new.five_hour, HIT_THRESHOLD)
         || crossed_threshold(&prev.seven_day, &new.seven_day, HIT_THRESHOLD)
     {
-        return Some("threshold-crossed-97pct");
+        return Some("threshold-crossed");
     }
     // 5) 任一窗口新出现 surpassed-threshold 头
     if newly_surpassed(&prev.five_hour, &new.five_hour)
@@ -1353,11 +1353,12 @@ mod tests {
 
     #[test]
     fn decide_flush_crossing_full_triggers() {
+        // v1.9.8: HIT_THRESHOLD 0.97 → 0.95, prev 必须 < 0.95 才触发 cross
         let recent = Instant::now();
         let prev = LimitState {
             last_db_flush_at: Some(recent),
             five_hour: Some(WindowSnapshot {
-                utilization: 0.96,
+                utilization: 0.94,
                 resets_at: Utc::now() + chrono::Duration::hours(2),
                 status: UnifiedStatus::Allowed,
                 surpassed_threshold: None,
@@ -1473,11 +1474,12 @@ mod tests {
     }
 
     #[test]
-    fn availability_at_96pct_available() {
-        // 96% 仍可调度, 但调用方可通过 priority_penalty 软降权
+    fn availability_at_94pct_available() {
+        // 94% 仍可调度, 但调用方可通过 priority_penalty 软降权 (在 90-95% 区间)
+        // v1.9.8 阈值收紧到 0.95, 测试值同步从 0.96 降到 0.94 保持"低于阈值"语义
         let state = LimitState {
             five_hour: Some(WindowSnapshot {
-                utilization: 0.96,
+                utilization: 0.94,
                 resets_at: Utc::now() + chrono::Duration::hours(1),
                 status: UnifiedStatus::AllowedWarning,
                 surpassed_threshold: None,
