@@ -568,6 +568,27 @@ impl AccountService {
             };
         }
 
+        // 3b. 软恢复 403 cooldown 中 → 归 RateLimited (调度器已经跳过, UI 也要显示成
+        // "限流中" 而非 "可用", 否则用户看到 status=active 误以为正常)。
+        if account.is_in_403_cooldown() {
+            let recovers_at = account
+                .extra
+                .get("auth_403_cooldown_until")
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            let count = account
+                .extra
+                .get("auth_403_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            return AccountCategorization {
+                category: AccountCategory::RateLimited,
+                reason: format!("403 cooldown ({}/3 strikes)", count),
+                recovers_at,
+            };
+        }
+
         // 4. LimitStore 内存判定 → 限流中
         match self.limit_store.availability(account.id) {
             crate::service::limit::Availability::Unavailable { reason, until } => {
