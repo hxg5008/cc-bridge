@@ -322,6 +322,14 @@ impl LimitStore {
         if state.status == Some(UnifiedStatus::Rejected) {
             return false;
         }
+        // v1.9.13: Sonnet 7d 子 quota 满 (>= HIT_THRESHOLD) 提前下线, 不等到撞 429
+        // 才反应。usage poll 60s 周期填充 sonnet_seven_day, 滞后 ≤ 60s。
+        // 跟 Opus availability 用同一阈值 0.95 (5% 刹车距离)。
+        if let Some(s) = &state.sonnet_seven_day {
+            if s.utilization >= HIT_THRESHOLD && s.resets_at > Utc::now() {
+                return false;
+            }
+        }
         true
     }
 
