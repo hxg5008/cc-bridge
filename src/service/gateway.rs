@@ -672,17 +672,33 @@ impl GatewayService {
                 break resp;
             }
 
-            // 429 黏性透传：不切号、不 retry，把原 body 替换为通用文案后返回给客户端。
-            // absorb_headers 已在 forward_request 里执行，state 更新后续请求会自动避开。
-            // 不 retry 原因: 换号 = 新号无 prompt cache → 该请求成本 ~10x。代价 > 客户端体验。
+            // 429 处理 (v1.9.16):
+            //   - Sonnet 配额 429: sticky 透传, 不 retry (Anthropic 自己说 sonnet quota 满,
+            //     换号也是 7d 子 quota 慢恢复, 没意义)
+            //   - 其他 429 (RPM/TPM burst 短期限流, 5h/7d 总窗口) → retry 另一号
+            //     场景: bot/agent 高 RPM 持续撞同一 sticky 号, Anthropic 给 60s 短期 ban
+            //     之前 sticky preserve 死锁 -> 客户持续看 429。 retry 后 sticky 仍被
+            //     account_svc 内部 evict (见 v1.9.16 B), 后续请求路由到新号。
+            //     代价: 该次请求 cache miss (新号无 prompt 缓存) → 该次成本 ~10x。
+            //     收益: 客户端少看 429。商用换体验值得。
             if crate::service::limit::is_sonnet_rejection(resp.headers()) {
                 info!(
                     "account {} returned 429 for sonnet quota (sticky, no retry)",
                     account.id
                 );
-            } else {
-                warn!("account {} returned 429 (sticky, no retry)", account.id);
+                break wrap_429_response(resp);
             }
+            if attempt < MAX_ATTEMPTS {
+                warn!(
+                    "account {} returned 429, retry on another (attempt {}/{})",
+                    account.id, attempt, MAX_ATTEMPTS
+                );
+                // 消费 body 释放 slot
+                let _ = axum::body::to_bytes(resp.into_body(), 64 * 1024).await;
+                excluded_for_retry.push(account.id);
+                continue;
+            }
+            warn!("account {} returned 429, last attempt also failed (sticky, returned to client)", account.id);
             break wrap_429_response(resp);
         };
 

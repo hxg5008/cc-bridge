@@ -65,6 +65,12 @@ pub struct AccountService {
     /// 用于 refresh_token 失效时的 session_key 自愈 fallback。
     /// Optional 是为了向后兼容（旧测试代码可能不传）。
     oauth_flow_svc: Option<Arc<crate::service::oauth_flow::OAuthFlowService>>,
+    /// v1.9.16 B: sticky burst-evict 计数。
+    /// 同一 session_hash 在短时间内被 preserve N 次后, 主动 evict 避免死锁。
+    /// 场景: bot/agent 高 RPM 撞同一 sticky 号 + 该号被 Anthropic 短期限流 →
+    /// 老逻辑 preserve 后下次还路由到这号 → 继续撞 429 → 形成死锁。
+    /// 用 dashmap 避免锁竞争。
+    sticky_burst_count: dashmap::DashMap<String, (u32, Instant)>,
 }
 
 impl AccountService {
@@ -79,6 +85,7 @@ impl AccountService {
             limit_store,
             usage_cooldown: Mutex::new(HashMap::new()),
             oauth_flow_svc: None,
+            sticky_burst_count: dashmap::DashMap::new(),
         }
     }
 
@@ -218,6 +225,8 @@ impl AccountService {
                             && rate_limit_ok
                             && cooldown_ok
                         {
+                            // v1.9.16 B: sticky 命中成功 → 清掉 burst 计数 (避免长期累积)
+                            self.sticky_burst_count.remove(session_hash);
                             return Ok(account);
                         }
                         // 校验失败：判断是临时还是永久
@@ -227,23 +236,58 @@ impl AccountService {
                             && id_allowed
                             && !exclude_ids.contains(&account_id)
                         {
-                            sticky_preserved = true;
-                            crate::service::metrics::METRICS.record_sticky_preserved();
-                            // 启动后头 60s 内的 sticky-preserved 大概率是
-                            // "Redis sticky 还在但内存 LimitStore 是空的" 引起,
-                            // 单独计数方便观察重启抖动 (Phase2: 重启第一波监控)
-                            let started = crate::service::metrics::METRICS
-                                .started_at_unix
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            let now = chrono::Utc::now().timestamp();
-                            if started > 0 && now - started < 60 {
-                                crate::service::metrics::METRICS
-                                    .record_post_restart_first_select();
+                            // v1.9.16 B: sticky burst-evict 检测
+                            // 同 session_hash 短时间内反复被 preserve = 客户高 RPM 持续撞限流号,
+                            // 老逻辑保留 sticky 等号恢复 → 形成死锁 (bot 1 分钟撞几十次同号 429)。
+                            // 阈值: 60s 内被 preserve >= 5 次 → 主动 evict sticky, 让下次请求选别的号。
+                            const BURST_WINDOW_SECS: u64 = 60;
+                            const BURST_THRESHOLD: u32 = 5;
+                            let now_inst = Instant::now();
+                            let mut should_evict_burst = false;
+                            {
+                                let mut entry = self
+                                    .sticky_burst_count
+                                    .entry(session_hash.to_string())
+                                    .or_insert((0, now_inst));
+                                let elapsed = now_inst.saturating_duration_since(entry.1);
+                                if elapsed > Duration::from_secs(BURST_WINDOW_SECS) {
+                                    // 窗口外, 重置
+                                    *entry = (1, now_inst);
+                                } else {
+                                    entry.0 += 1;
+                                    if entry.0 >= BURST_THRESHOLD {
+                                        should_evict_burst = true;
+                                    }
+                                }
                             }
-                            info!(
-                                "sticky preserved for account {} (rate-limited, will retry next request)",
-                                account_id
-                            );
+                            if should_evict_burst {
+                                let _ = self.cache.delete_session(session_hash).await;
+                                self.sticky_burst_count.remove(session_hash);
+                                crate::service::metrics::METRICS.record_sticky_evicted();
+                                warn!(
+                                    "sticky burst-evict for account {} (preserved {}x in {}s, route to fresh account)",
+                                    account_id, BURST_THRESHOLD, BURST_WINDOW_SECS
+                                );
+                                // fall through 走候选选号 (不进 sticky_preserved 分支)
+                            } else {
+                                sticky_preserved = true;
+                                crate::service::metrics::METRICS.record_sticky_preserved();
+                                // 启动后头 60s 内的 sticky-preserved 大概率是
+                                // "Redis sticky 还在但内存 LimitStore 是空的" 引起,
+                                // 单独计数方便观察重启抖动 (Phase2: 重启第一波监控)
+                                let started = crate::service::metrics::METRICS
+                                    .started_at_unix
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                let now = chrono::Utc::now().timestamp();
+                                if started > 0 && now - started < 60 {
+                                    crate::service::metrics::METRICS
+                                        .record_post_restart_first_select();
+                                }
+                                info!(
+                                    "sticky preserved for account {} (rate-limited, will retry next request)",
+                                    account_id
+                                );
+                            }
                         } else {
                             let _ = self.cache.delete_session(session_hash).await;
                             crate::service::metrics::METRICS.record_sticky_evicted();
