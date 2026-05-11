@@ -4,6 +4,9 @@ WORKDIR /app/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ ./
+# vite.config.ts 读 ../.version 注入 __APP_VERSION__, docker 构建阶段必须把
+# .version 也拷进来, 否则 UI 显示 "vdev" (v1.9.9 漏修)。
+COPY .version /app/.version
 RUN npm run build
 
 # Stage 2: Build Rust backend
