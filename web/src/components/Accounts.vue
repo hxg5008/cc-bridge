@@ -90,7 +90,7 @@ const pagedAccounts = computed(() => {
   return filteredAccounts.value.slice(start, start + pageSize.value);
 });
 
-/** 订阅档位 → 显示标签 (max5/max20/pro/free/...) */
+/** 订阅档位 → 显示标签 (max5/max20/pro/raven/...) */
 function subscriptionLabel(t?: string | null): string {
   switch ((t || '').toLowerCase()) {
     case 'pro': return 'Pro';
@@ -100,6 +100,7 @@ function subscriptionLabel(t?: string | null): string {
     case 'max': return 'Max';
     case 'team': return 'Team';
     case 'enterprise': return 'Enterprise';
+    case 'default_raven': return 'Raven';
     default: return t || '';
   }
 }
@@ -111,6 +112,7 @@ function subscriptionBadgeClass(t?: string | null): string {
     case 'max5':
     case 'max': return 'bg-amber-100 text-amber-700 border-amber-200';
     case 'pro': return 'bg-sky-100 text-sky-700 border-sky-200';
+    case 'default_raven': return 'bg-emerald-100 text-emerald-700 border-emerald-200';
     case 'team': return 'bg-indigo-100 text-indigo-700 border-indigo-200';
     case 'enterprise': return 'bg-fuchsia-100 text-fuchsia-700 border-fuchsia-200';
     case 'free': return 'bg-gray-100 text-gray-600 border-gray-200';
@@ -1223,8 +1225,7 @@ async function copyText(text: string) {
         <option value="max20">Max 20x</option>
         <option value="max5">Max 5x</option>
         <option value="pro">Pro</option>
-        <option value="free">Free</option>
-        <option value="__none__">未识别</option>
+        <option value="default_raven">Raven</option>
       </select>
       <select
         v-model.number="autoRefreshSec"
